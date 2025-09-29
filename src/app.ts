@@ -35,6 +35,16 @@ const app: Application = express();
 // app.use(cors(corsOptions));
 app.use(cors());
 app.use(express.json());
+
+app.get('/', (req: Request, res: Response) => {
+  res.send('Backend up ✅ MongoDB connected');
+});
+
+app.get('/ping', (req: Request, res: Response) => {
+  const ready = mongoose.connection.readyState; // 1 means connected
+  res.json({ status: ready === 1 ? 'ok' : 'not connected' });
+});
+
 app.use("/api/auth", authRoutes);
 app.use("/api/facilities", facilityRoutes);
 app.use("/api/ai", aiRoutes);
