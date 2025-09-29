@@ -65,10 +65,10 @@ const connectDB = async () => {
     });
     console.log('✅ MongoDB Connected successfully.');
 
-    await Facility.syncIndexes();
-    console.log("✅ Geo Index confirmed and synced.");
+    // await Facility.syncIndexes();
+    // console.log("✅ Geo Index confirmed and synced.");
 
-    startFacilitySyncCron();
+    // startFacilitySyncCron();
 
     const PORT: number = Number(process.env.PORT) || 5000;
     app.listen(PORT, '0.0.0.0', () =>
