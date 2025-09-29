@@ -64,14 +64,14 @@ const connectDB = async () => {
       serverSelectionTimeoutMS: 30000,
     });
     console.log('✅ MongoDB Connected successfully.');
-        // try {
-        //     await Facility.syncIndexes();
-        //     console.log("✅ Geo Index confirmed and synced.");
-        // } catch (err) {
-        //     // Log if syncing fails, but allow the app to run
-        //     console.error("Index sync failed:", err);
-        // }
-        // startFacilitySyncCron();
+        try {
+            await Facility.syncIndexes();
+            console.log("✅ Geo Index confirmed and synced.");
+        } catch (err) {
+            // Log if syncing fails, but allow the app to run
+            console.error("Index sync failed:", err);
+        }
+        startFacilitySyncCron();
 
     // Start Express server
     const PORT: number = Number(process.env.PORT) || 5000;
