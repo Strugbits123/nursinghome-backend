@@ -15,7 +15,7 @@ export const startFacilitySyncCron = () => {
       console.error('Error running CMS facility sync cron job:', error);
     }
     // stop the job after first execution
-    job.stop();
+    // job.stop();
     console.log("🛑 Facility sync cron stopped after first run.");
 
     console.log(`--- CRON JOB END: CMS Facility Sync (${new Date().toISOString()}) ---`);
