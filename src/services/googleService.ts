@@ -2,6 +2,8 @@
 import axios from "axios";
 
 const apiKey = process.env.GOOGLE_API_KEY || "";
+const API_KEY = process.env.GOOGLE_API_KEY; 
+const BASE_GEOCODING_URL = 'https://maps.googleapis.com/maps/api/geocode/json';
 
 // 👇 Define types for strong typing
 export interface PlacePhoto {
@@ -25,7 +27,39 @@ export interface PlaceDetails {
   reviews: PlaceReview[];
   rating: number | null;
 }
+// 💡 NEW FUNCTION: To convert a place name to coordinates
+export const getCoordinatesByPlaceName = async (placeName: string) => {
+    if (!API_KEY) {
+        throw new Error("GOOGLE_MAPS_API_KEY is not set.");
+    }
+    
+    // Encode the address string for the URL
+    const address = encodeURIComponent(placeName);
 
+    try {
+        const response = await axios.get(
+            `${BASE_GEOCODING_URL}?address=${address}&key=${API_KEY}`
+        );
+
+        const data = response.data;
+
+        if (data.status === 'OK' && data.results.length > 0) {
+            const location = data.results[0].geometry.location;
+            
+            // Return the latitude and longitude
+            return {
+                lat: location.lat,
+                lng: location.lng
+            };
+        } else {
+            // Handle specific errors like ZERO_RESULTS
+            throw new Error(`Geocoding failed for "${placeName}". Status: ${data.status}`);
+        }
+    } catch (err) {
+        console.error("Google Geocoding API error:", err);
+        throw new Error("Failed to fetch coordinates from Google.");
+    }
+};
 
 
 // 🔹 Get placeId from name (Text Search API)

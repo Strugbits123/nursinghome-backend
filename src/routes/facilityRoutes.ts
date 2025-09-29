@@ -3,12 +3,16 @@ import {
   searchFacilities,
   getFacilityById,
   syncFacilities,
-  searchFacilitiesWithReviews
+  searchFacilitiesWithReviews,
+  getFacilityDetails,
+  filterFacilitiesWithReviews
 } from "../controllers/facilityController";
-import { protect } from "../middlewares/authMiddleware";
+import { protect } from "../middleware/authMiddleware";
 
 const router = Router();
 router.get("/with-reviews", searchFacilitiesWithReviews);
+router.get('/details', getFacilityDetails); 
+router.get("/filter-with-reviews", filterFacilitiesWithReviews);
 
 // Public route
 router.get("/search", searchFacilities);

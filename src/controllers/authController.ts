@@ -1,21 +1,75 @@
-import { Request, Response } from "express";
-import jwt from "jsonwebtoken";
+import { Request, Response } from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { User, IUser } from '../models/User';
 
 interface JwtPayload {
-  id: number;
-  email: string;
-  role: string;
+  id: string;
+  email: string;
+  role: string;
 }
 
-export const login = (req: Request, res: Response): Response => {
-  const { email, password } = req.body as { email?: string; password?: string };
+// REGISTER
+export const register = async (req: Request, res: Response) => {
+  try {
+    const { email, password, role } = req.body;
 
-  if (email === "admin@test.com" && password === "123456") {
-    const payload: JwtPayload = { id: 1, email, role: "admin" };
-    const token = jwt.sign(payload, process.env.JWT_SECRET || "default_secret", { expiresIn: "1d" });
+    // Check existing user
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ success: false, message: 'User already exists' });
+    }
 
-    return res.json({ success: true, token });
-  }
+    // Create user (password hashing is handled by the pre-save hook in the model)
+    const user = new User({
+      email,
+      password: password, // The plain password before the hook runs
+      role: role || 'user',
+    });
 
-  return res.status(401).json({ success: false, message: "Invalid credentials" });
+    await user.save();
+
+    return res.status(201).json({ success: true, message: 'User registered successfully' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// LOGIN
+export const login = async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+
+    // Find user and EXPLICITLY SELECT THE PASSWORD field to bypass 'select: false'
+    const user = await User.findOne({ email }).select('+password'); 
+    
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    // Compare passwords using the model's custom method
+    const isMatch = await user.comparePassword(password);
+    
+    if (!isMatch) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    // Create JWT payload
+    const payload: JwtPayload = {
+      id: String(user._id),
+      email: user.email,
+      role: user.role,
+    };
+
+    // Sign and create JWT
+    const token = jwt.sign(payload, process.env.JWT_SECRET || 'default_secret', {
+      expiresIn: '1d', // Token expires in 1 day
+    });
+
+    return res.json({ success: true, token });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
 };
