@@ -8,6 +8,7 @@ import { PlaceDetails,
   getPlaceDetails, getCoordinatesByPlaceName } from "../services/googleService";
 import { summarizeReviews, SummarizeResult } from "../services/aiService";
 import Facility from "../models/NursingFacility"; 
+import { getCache, setCache } from "../config/redisClient";
 
 
 
@@ -17,6 +18,20 @@ import Facility from "../models/NursingFacility";
 const CMS_API_URL =
   "https://data.cms.gov/provider-data/api/1/datastore/query/4pq5-n9py/0";
 
+const SEARCH_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60; 
+const SEARCH_CACHE_KEY = (query: { lat?: string; lng?: string; q?: string }) => {
+    if (query.lat && query.lng) {
+        // Key for coordinates search (normalize to fixed decimal places for consistency)
+        const lat = parseFloat(query.lat).toFixed(4);
+        const lng = parseFloat(query.lng).toFixed(4);
+        return `search:nearby:${lat}_${lng}`;
+    }
+    if (query.q) {
+        // Key for text search (normalize query string)
+        return `search:query:${query.q.trim().toLowerCase().replace(/\s+/g, '_')}`;
+    }
+    return 'search:invalid';
+};
 
 // export const searchFacilitiesWithReviews = async (
 //   req: Request,
@@ -201,25 +216,20 @@ export const getFacilityDetails = async (
         
         let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] }; 
 
-         // Extract reviews text from the fetched googleData, not the undefined 'details'
         const reviewsText = googleData.reviews ? googleData.reviews.map((r: any) => r.text).join("\n") : "";
 
-        // Conditionally call the expensive AI summary function
         if (reviewsText) {
-            // FIX: Assign the result of the async call back to the 'aiSummary' variable
             aiSummary = await summarizeReviews(reviewsText);
         }
         
-        // 4. Merge and return the result
         res.json({
             ...facility, 
             googleName: googleData.googleName,
             rating: googleData.rating,
-            photos: googleData.photos, // Array of 4 photo URLs
-            reviews: googleData.reviews, // Array of Google reviews
+            photos: googleData.photos,
+            reviews: googleData.reviews,
             lat: googleData.lat,
             lng: googleData.lng,
-            // Include the dynamically generated AI summary
             aiSummary,
         });
 
@@ -267,6 +277,17 @@ export const searchFacilitiesWithReviews = async (
 ) => {
   try {
      const { lat, lng, q } = req.query as { lat?: string; lng?: string; q?: string };
+     const cacheKey = SEARCH_CACHE_KEY(req.query as { lat?: string; lng?: string; q?: string });
+
+    // --- 1. REDIS CACHE CHECK ---
+    if (cacheKey !== 'search:invalid') {
+        const cachedResult = await getCache(cacheKey);
+        if (cachedResult) {
+            console.log(`✅ CACHE HIT for search key: ${cacheKey}`);
+            return res.status(200).json(JSON.parse(cachedResult));
+        }
+        console.log(`❌ CACHE MISS for search key: ${cacheKey}`);
+    }
 
     // ✅ Case 1: Search by coordinates (nearby)
     if (lat && lng) {
@@ -288,6 +309,14 @@ export const searchFacilitiesWithReviews = async (
         },
       }).limit(50);
 
+      // --- 2. CACHE SET FOR NEARBY SEARCH (30 DAYS) ---
+      if (nearbyFacilities.length > 0) {
+        await setCache(
+            cacheKey, 
+            JSON.stringify(nearbyFacilities), 
+            SEARCH_CACHE_TTL_SECONDS
+        );
+      }
       return res.status(200).json(nearbyFacilities);
     }
 
@@ -356,6 +385,15 @@ export const searchFacilitiesWithReviews = async (
         };
       })
     );
+    
+     // --- 3. CACHE SET FOR TEXT SEARCH (30 DAYS) ---
+    if (finalResults.length > 0) {
+        await setCache(
+            cacheKey, 
+            JSON.stringify(finalResults), 
+            SEARCH_CACHE_TTL_SECONDS
+        );
+    }
 
     res.status(200).json(finalResults);
   } catch (err) {
