@@ -127,6 +127,10 @@ export interface INursingFacility extends Document {
   latitude: number | null;
   longitude: number | null;
   geocoding_footnote: string | null;
+  geoLocation: {
+    type: string;
+    coordinates: number[];
+  };
   processing_date: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -231,24 +235,27 @@ const NursingFacilitySchema = new Schema<INursingFacility>({
   location: { type: String },
   latitude: { type: Number },
   longitude: { type: Number },
+  geoLocation: {
+      type: {
+        type: String,
+        enum: ["Point"],
+        default: "Point",
+      },
+      coordinates: {
+        type: [Number], // [longitude, latitude]
+        index: "2dsphere",
+      },
+    },
   geocoding_footnote: { type: String },
   processing_date: { type: Date },
 }, { timestamps: true });
-NursingFacilitySchema.index(
-    { longitude: '2d' },
-    { name: 'geo_2d_fix_final', background: true } 
-);
-// NursingFacilitySchema.index(
-//     { longitude: 1, latitude: 1 }, 
-//     { 
-//         '2d': 1, 
-//         min: -180, 
-//         max: 180, 
-//         name: 'geo_2d_fix', 
-//         background: true 
-//     } as any // <-- Must include 'as any'
-// );
-const NursingFacility = mongoose.model<INursingFacility>("NursingFacility", NursingFacilitySchema);
+NursingFacilitySchema.index({ geoLocation: "2dsphere" });
 
+
+
+const NursingFacility = mongoose.model<INursingFacility>(
+  "NursingFacility",
+  NursingFacilitySchema
+);
 
 export default NursingFacility;

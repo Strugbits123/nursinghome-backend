@@ -5,7 +5,7 @@ import * as googleService from "../services/googleService";
 import axios from "axios";
 import { PlaceDetails,
   findPlaceIdByText,  
-  getPlaceDetails } from "../services/googleService";
+  getPlaceDetails, getCoordinatesByPlaceName } from "../services/googleService";
 import { summarizeReviews, SummarizeResult } from "../services/aiService";
 import Facility from "../models/NursingFacility"; 
 
@@ -156,7 +156,7 @@ const fetchAndCacheGoogleData = async (facility: any) => {
                     rating: newCache.rating,
                     lat: newCache.lat,
                     lng: newCache.lng,
-                    photos: photoUrls, // Return array of photo URLs
+                    photos: photoUrls,
                     reviews: reviews, 
                   };
             }
@@ -168,7 +168,7 @@ const fetchAndCacheGoogleData = async (facility: any) => {
     return { googleName: null, rating: null, lat: null, lng: null, photos: [], reviews: [] };
 };
 
-// 💡 NEW API: Get Facility Details
+// Get Facility Details
 export const getFacilityDetails = async (
     req: Request,
     res: Response,
@@ -180,25 +180,25 @@ export const getFacilityDetails = async (
             return res.status(400).json({ message: "Facility name is required." });
         }
         
-        // 1. Trim and escape the name for safe RegExp usage
-        const nameToSearch = name.trim();
-        
-        // FIX: Change to a "contains" search (no ^ and $ anchors) for better resilience
-        const facility = await Facility.findOne({ 
-            provider_name: new RegExp(nameToSearch, 'i') 
-        }).lean(); 
+        const safeName = name.trim();
+        const firstWord = safeName.split(/\s+/)[0];
+        const escapedPrefix = firstWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const searchPrefix = escapedPrefix;
+        const facility = await Facility.findOne({
+          provider_name: { $regex: `^${searchPrefix}`, $options: "i" }
+        })
+        .sort({ provider_name: 1 }) 
+        .lean();
 
         if (!facility) {
-            console.log(`[DETAIL DEBUG] FAILED to find facility using name: ${nameToSearch}`);
-            return res.status(404).json({ message: "Facility not found." });
+          console.log(`[DETAIL DEBUG] No facilities found with prefix: ${searchPrefix}`);
+          return res.status(404).json({ message: "Facility not found." });
         }
+  
         
-        // 2. Fetch Google details (uses cache or API call)
         const googleData = await fetchAndCacheGoogleData(facility);
         
-        // 3. AI Summary Logic (FIXED)
         
-        // Initialize AI Summary object with safe defaults
         let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] }; 
 
          // Extract reviews text from the fetched googleData, not the undefined 'details'
@@ -228,314 +228,490 @@ export const getFacilityDetails = async (
     }
 };
 
-// ... keep searchFacilitiesWithReviews function below this ...
 
-export const searchFacilitiesWithReviews = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-) => {
-    try {
-        const { city, state, zip } = req.query as { city?: string; state?: string; zip?: string; };
-
-        const query: any = {};
-        if (city) query.city_town = new RegExp(city, "i");
-        if (state) query.state = state.toUpperCase();
-        if (zip) query.zip_code = zip;
-
-        const facilities = await Facility.find(query).limit(10).lean(); 
-
-        // Execute all 10 cache/API operations in PARALLEL
-        const googlePromises = facilities.map(f => fetchAndCacheGoogleData(f));
-        const googleResults = await Promise.all(googlePromises);
-
-        // Merge the results (using the FIRST photo for the list view)
-        const finalResults = facilities.map((f, index) => {
-            const googleData = googleResults[index];
-            const aiSummary = { summary: "", pros: [], cons: [] };
-
-            return {
-                ...f, 
-                googleName: googleData.googleName,
-                rating: googleData.rating,
-                // Only return the first photo for the list view
-                photo: googleData.photos.length > 0 ? googleData.photos[0] : null, 
-                lat: googleData.lat,
-                lng: googleData.lng,
-                aiSummary,
-            };
-        });
-
-        res.json(finalResults);
-    } catch (err) {
-        next(err); 
-    }
+// ✅ Map of states (Full Name → Abbreviation)
+const stateToAbbr: Record<string, string> = {
+  "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
+  "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE", "Florida": "FL", "Georgia": "GA",
+  "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
+  "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+  "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+  "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH",
+  "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY", "North Carolina": "NC",
+  "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA",
+  "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD", "Tennessee": "TN",
+  "Texas": "TX", "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA",
+  "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY"
 };
+
+// ✅ Detects query type and normalizes state names
+function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
+  const zipRegex = /^\d{5}$/; // 5-digit ZIP Code (like "07001")
+  if (zipRegex.test(q)) return { type: "zip", value: q };
+
+  // Check if full state name → convert to abbreviation
+  const stateMatch = Object.keys(stateToAbbr).find(
+    state => state.toLowerCase() === q.toLowerCase()
+  );
+  if (stateMatch) return { type: "state", value: stateToAbbr[stateMatch] };
+
+  // Otherwise, treat as city
+  return { type: "city", value: q };
+}
+
+// ✅ Controller
+export const searchFacilitiesWithReviews = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+     const { lat, lng, q } = req.query as { lat?: string; lng?: string; q?: string };
+
+    // ✅ Case 1: Search by coordinates (nearby)
+    if (lat && lng) {
+      const latitude = parseFloat(lat);
+      const longitude = parseFloat(lng);
+
+      if (isNaN(latitude) || isNaN(longitude)) {
+        return res.status(400).json({ message: "Invalid coordinates" });
+      }
+
+      console.log("📍 Searching nearby facilities:", latitude, longitude);
+
+      const nearbyFacilities = await Facility.find({
+        geoLocation: {
+          $near: {
+            $geometry: { type: "Point", coordinates: [longitude, latitude] },
+            $maxDistance: 50000, // 50km radius
+          },
+        },
+      }).limit(50);
+
+      return res.status(200).json(nearbyFacilities);
+    }
+
+    if (!q) {
+      return res.status(400).json({ message: "Missing search query" });
+    }
+
+    const safeQuery = q.trim();
+    const { type, value } = normalizeQuery(safeQuery);
+
+    console.log("🔍 Detected:", type, "| Normalized Value:", value);
+
+    const mongoQuery: any = {};
+
+    if (type === "zip") {
+      mongoQuery.zip_code = value;
+    } else if (type === "state") {
+      mongoQuery.state = new RegExp(`^${value}$`, "i");
+    } else {
+      mongoQuery.city_town = new RegExp(value, "i");
+    }
+
+    // Fetch facilities from MongoDB
+    const facilities = await Facility.find(mongoQuery).lean();
+
+    if (!facilities || facilities.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    // ✅ Fetch Google data in parallel
+    const googleResults = await Promise.all(
+      facilities.map((facility) => fetchAndCacheGoogleData(facility))
+    );
+
+    // ✅ Process AI summaries in parallel (safe)
+    const finalResults = await Promise.all(
+      facilities.map(async (facility, index) => {
+        const googleData = googleResults[index];
+
+        // Default structure
+        let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] };
+
+        // ✅ Extract review text safely
+        const reviewsText = googleData.reviews
+          ? googleData.reviews.map((r: any) => r.text).join("\n")
+          : "";
+
+        // ✅ Conditionally generate AI summary
+        if (reviewsText) {
+          try {
+            aiSummary = await summarizeReviews(reviewsText);
+          } catch (err) {
+            console.error("⚠️ AI Summary failed for facility:", facility.provider_name, err);
+          }
+        }
+
+        // ✅ Return merged final object
+        return {
+          ...facility,
+          googleName: googleData.googleName,
+          rating: googleData.rating,
+          photo: googleData.photos?.[0] || null,
+          lat: googleData.lat,
+          lng: googleData.lng,
+          aiSummary, // 👈 included
+        };
+      })
+    );
+
+    res.status(200).json(finalResults);
+  } catch (err) {
+    console.error("❌ Error in searchFacilitiesWithReviews:", err);
+    next(err);
+  }
+};
+
+
+// export const filterFacilitiesWithReviews = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction
+// ) => {
+//   try {
+//     const {
+//       city,
+//       state,
+//       zip,
+//       bedsMin,
+//       bedsMax,
+//       ownership,
+//       distanceKm,
+//       userLat,
+//       userLng,
+//       locationName,
+//       fromLocation,
+//       toLocation,
+//       ratingMin,
+//     } = req.query as any;
+
+//     const limit = 20;
+//     const pipeline: any[] = [];
+//     const matchQuery: any = {};
+//     let finalLat: number | null = null;
+//     let finalLng: number | null = null;
+//     let finalDistanceKm: number | null = null;
+//     let fromToDistanceKm: number | null = null;
+//     let isGeoSearch = false;
+
+//     // 🗺️ 1️⃣ FROM → TO SEARCH
+//     if (fromLocation && toLocation) {
+//       isGeoSearch = true;
+//       console.log("🚀 Performing FROM-TO search...");
+
+//       const fromCoords = await googleService.getCoordinatesByPlaceName(fromLocation);
+//       const toCoords = await googleService.getCoordinatesByPlaceName(toLocation);
+
+//       // Haversine formula
+//       const R = 6371;
+//       const dLat = ((toCoords.lat - fromCoords.lat) * Math.PI) / 180;
+//       const dLon = ((toCoords.lng - fromCoords.lng) * Math.PI) / 180;
+//       const a =
+//         Math.sin(dLat / 2) ** 2 +
+//         Math.cos(fromCoords.lat * Math.PI / 180) *
+//           Math.cos(toCoords.lat * Math.PI / 180) *
+//           Math.sin(dLon / 2) ** 2;
+//       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+//       fromToDistanceKm = R * c;
+
+//       finalLat = (fromCoords.lat + toCoords.lat) / 2;
+//       finalLng = (fromCoords.lng + toCoords.lng) / 2;
+//       finalDistanceKm = fromToDistanceKm / 2 + 50;
+//     }
+
+//     // 📍 2️⃣ USER LOCATION SEARCH
+//     else if (userLat && userLng) {
+//       isGeoSearch = true;
+//       finalLat = parseFloat(userLat);
+//       finalLng = parseFloat(userLng);
+//       finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+//     }
+
+//     // 🧭 3️⃣ LOCATION NAME SEARCH
+//     else if (locationName) {
+//       isGeoSearch = true;
+//       const coords = await googleService.getCoordinatesByPlaceName(locationName);
+//       finalLat = coords.lat;
+//       finalLng = coords.lng;
+//       finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+//     }
+
+//     // 🏙️ 4️⃣ CITY / STATE / ZIP FILTERS
+//     if (city) matchQuery.city_town = new RegExp(city, "i");
+//     if (state) matchQuery.state = state.toUpperCase();
+//     if (zip) matchQuery.zip_code = zip;
+
+//     // 🏠 5️⃣ OWNERSHIP TYPE
+//     if (ownership) {
+//       const ownershipArray = ownership.split(",").map((o: string) => o.trim());
+//       matchQuery.ownership_type = { $in: ownershipArray };
+//     }
+
+//     // 🛏️ 6️⃣ BEDS RANGE FILTER
+//     if (bedsMin || bedsMax) {
+//       matchQuery.number_of_certified_beds = {};
+//       if (bedsMin) matchQuery.number_of_certified_beds.$gte = parseInt(bedsMin);
+//       if (bedsMax) matchQuery.number_of_certified_beds.$lte = parseInt(bedsMax);
+//     }
+
+//     // 🌎 7️⃣ GEO FILTER (optional)
+//     if (isGeoSearch && finalLat && finalLng) {
+//       pipeline.push({
+//         $geoNear: {
+//           near: { type: "Point", coordinates: [finalLng, finalLat] },
+//           distanceField: "distance_m",
+//           key: "geoLocation",
+//           maxDistance: (finalDistanceKm || 20) * 1000, // meters
+//           spherical: true,
+//           query: matchQuery,
+//         },
+//       });
+//     } else {
+//       pipeline.push({ $match: matchQuery });
+//     }
+
+//     // ⭐ 8️⃣ RATING FILTER
+//     const ratingMinNum = ratingMin ? parseInt(ratingMin) : null;
+//     if (ratingMinNum && ratingMinNum >= 1 && ratingMinNum <= 5) {
+//       pipeline.push({
+//         $addFields: {
+//           numeric_overall_rating: {
+//             $cond: {
+//               if: {
+//                 $and: [
+//                   { $ifNull: ["$overall_rating", false] },
+//                   { $ne: ["$overall_rating", ""] },
+//                 ],
+//               },
+//               then: { $toDouble: "$overall_rating" },
+//               else: 0,
+//             },
+//           },
+//         },
+//       });
+
+//       pipeline.push({
+//         $match: { numeric_overall_rating: { $gte: ratingMinNum } },
+//       });
+//     }
+
+//     // 🔢 LIMIT
+//     pipeline.push({ $limit: limit });
+
+//     // 🚀 EXECUTE
+//     const facilities = await Facility.aggregate(pipeline);
+//     console.log(`✅ Found ${facilities.length} facilities`);
+
+//     // 🧠 GOOGLE PLACE DATA
+//     const googleResults = await Promise.all(
+//       facilities.map((f: any) => fetchAndCacheGoogleData(f))
+//     );
+
+//     const finalResults = facilities.map((f: any, i: number) => {
+//       const g = googleResults[i];
+//       return {
+//         ...f,
+//         distance_km: f.distance_m ? f.distance_m / 1000 : null,
+//         googleName: g?.googleName,
+//         rating: g?.rating,
+//         photo: g?.photos?.[0] || null,
+//         lat: g?.lat || f.latitude,
+//         lng: g?.lng || f.longitude,
+//         aiSummary: { summary: "", pros: [], cons: [] },
+//       };
+//     });
+
+//     // 📦 RESPONSE
+//     const response: any = { facilities: finalResults };
+//     if (fromLocation && toLocation) {
+//       response.fromLocation = fromLocation;
+//       response.toLocation = toLocation;
+//       response.fromToDistanceKm = fromToDistanceKm;
+//     } else if (isGeoSearch && finalLat && finalLng) {
+//       response.centerCoords = { lat: finalLat, lng: finalLng };
+//     }
+
+//     res.json(response);
+//   } catch (err) {
+//     console.error("❌ Error in filterFacilitiesWithReviews:", err);
+//     next(err);
+//   }
+// };
 
 export const filterFacilitiesWithReviews = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
+  req: Request,
+  res: Response,
+  next: NextFunction
 ) => {
-    try {
-        // 1. Get all potential query parameters, including the new 'locationName'
-        const { 
-            city, state, zip, bedsMin, bedsMax, ownership,
-            distanceKm, userLat, userLng, locationName 
-        } = req.query as { 
-            city?: string; state?: string; zip?: string;
-            bedsMin?: string; bedsMax?: string; ownership?: string;
-            distanceKm?: string; userLat?: string; userLng?: string;
-            locationName?: string; // Location name (e.g., "Eiffel Tower")
-        };
+  try {
+    const {
+      city,
+      state,
+      zip,
+      bedsMin,
+      bedsMax,
+      ownership,
+      distanceKm,
+      userLat,
+      userLng,
+      locationName,
+      fromLocation,
+      toLocation,
+      ratingMin,
+    } = req.query as any;
 
-        const limit = 10;
-        
-        // Initial coordinate parsing
-        let lat = userLat ? parseFloat(userLat) : NaN;
-        let lng = userLng ? parseFloat(userLng) : NaN;
-        let distance = distanceKm ? parseFloat(distanceKm) : NaN;
+    const pipeline: any[] = [];
+    const matchQuery: any = {};
+    let finalLat: number | null = null;
+    let finalLng: number | null = null;
+    let finalDistanceKm: number | null = null;
+    let fromToDistanceKm: number | null = null;
+    let isGeoSearch = false;
 
-        const hasExplicitGeo = !isNaN(lat) && !isNaN(lng) && !isNaN(distance);
-        
-        // --- 💡 1. Resolve coordinates from locationName using Google Geocoding ---
-        // This block executes if no userLat/userLng are provided, but locationName and distance are.
-        if (!hasExplicitGeo && locationName && !isNaN(distance)) {
-              const trimmedLocationName = locationName.trim();
-            if (trimmedLocationName) {
-                 try {
-                    console.log(`Geocoding location name: ${trimmedLocationName}`);
-                    // Use the service to convert the name to coordinates
-                    const coords = await googleService.getCoordinatesByPlaceName(trimmedLocationName);
-                    
-                    // Update lat/lng variables with the geocoded coordinates
-                    lat = coords.lat;
-                    lng = coords.lng;
-                    
-                } catch (err) {
-                    console.error(`Failed to geocode location name "${trimmedLocationName}":`, err);
-                    // If geocoding fails, we proceed without a geo-query
-                }
-            }
-                
-           
-        }
-        
-        // Re-check if geo query is now enabled (either explicitly or via locationName)
-        const geoQueryEnabled = !isNaN(lat) && !isNaN(lng) && !isNaN(distance);
-        
-        const userLngNum = lng;
-        const userLatNum = lat;
-        const distanceKmNum = distance; 
-        
-        // --- 2. Build Aggregation Pipeline ---
-        const pipeline: any[] = [];
-        const matchQuery: any = {};
-        
-        // --- A. $geoNear Stage (MUST BE FIRST IF USED) ---
-        if (geoQueryEnabled) {
-            // CRITICAL FIX: Attempt to force MongoDB to check its indexes before query
-            try {
-                // Access the raw MongoDB driver collection object via Mongoose model
-                const collection = Facility.collection; 
-                await collection.listIndexes().toArray();
-                console.log("🛠️ Index list forced before $geoNear query.");
-            } catch (err) {
-                // Ignore failure if collection doesn't exist yet or other non-critical error
-                console.error("Failed to list indexes for force-check:", err);
-            }
+    // 🗺️ 1️⃣ FROM → TO SEARCH
+    if (fromLocation && toLocation) {
+      isGeoSearch = true;
+      console.log("🚀 Performing FROM-TO search...");
 
-            const distanceMeters = distanceKmNum * 1000; 
+      const fromCoords = await googleService.getCoordinatesByPlaceName(fromLocation);
+      const toCoords = await googleService.getCoordinatesByPlaceName(toLocation);
 
-            pipeline.push({
-                $geoNear: {
-                    // near must be in the order of the 2d index [longitude, latitude]
-                    near: [userLngNum, userLatNum], 
-                    key: "longitude", // Must match the field name in the 2d index
-                    distanceField: "distance_m", 
-                    maxDistance: distanceMeters,
-                    spherical: true, 
-                    query: matchQuery // Apply other filters *before* geoNear executes
-                }
-            });
-        }
+      // Haversine formula
+      const R = 6371;
+      const dLat = ((toCoords.lat - fromCoords.lat) * Math.PI) / 180;
+      const dLon = ((toCoords.lng - fromCoords.lng) * Math.PI) / 180;
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos((fromCoords.lat * Math.PI) / 180) *
+          Math.cos((toCoords.lat * Math.PI) / 180) *
+          Math.sin(dLon / 2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      fromToDistanceKm = R * c;
 
-        // --- B. Build the $match Query for all other filters ---
-        // (Standard filtering logic remains unchanged)
-        
-        if (city) matchQuery.city_town = new RegExp(city, "i");
-        if (state) matchQuery.state = state.toUpperCase();
-        if (zip) matchQuery.zip_code = zip;
-        
-        // Bed Capacity Filter
-        const bedsMinNum = bedsMin ? parseInt(bedsMin) : null;
-        const bedsMaxNum = bedsMax ? parseInt(bedsMax) : null;
-        if (bedsMinNum || bedsMaxNum) {
-            matchQuery.number_of_certified_beds = {};
-            if (bedsMinNum) matchQuery.number_of_certified_beds.$gte = bedsMinNum;
-            if (bedsMaxNum) matchQuery.number_of_certified_beds.$lte = bedsMaxNum;
-        }
-
-        // Ownership Filter
-        if (ownership) {
-            const ownershipArray = ownership.split(',').map(o => o.trim());
-            matchQuery.ownership_type = { $in: ownershipArray };
-        }
-        
-        // If geoQuery was NOT enabled, start the pipeline with the main match
-        if (!geoQueryEnabled) {
-            if (Object.keys(matchQuery).length > 0) {
-                 pipeline.push({ $match: matchQuery });
-            }
-        }
-        
-        // --- C. Limit Stage ---
-        pipeline.push({ $limit: limit });
-
-        // 3. Execute Aggregation
-        // Temporary log for debugging the final query
-        console.log('Final Aggregation Pipeline:', JSON.stringify(pipeline, null, 2));
-
-        const facilities = await Facility.aggregate(pipeline); 
-
-        // 4. Execute all cache/API operations in PARALLEL
-        const googlePromises = facilities.map(f => fetchAndCacheGoogleData(f));
-        const googleResults = await Promise.all(googlePromises);
-
-        // 5. Merge the results
-        const finalResults = facilities.map((f, index) => {
-            const googleData = googleResults[index];
-            // Placeholder for future AI summary
-            const aiSummary = { summary: "", pros: [], cons: [] }; 
-
-            return {
-                ...f, 
-                // Add the calculated distance if geoQuery was run
-                distance_m: f.distance_m || null, 
-                distance_km: f.distance_m ? f.distance_m / 1000 : null,
-                
-                googleName: googleData.googleName,
-                rating: googleData.rating,
-                photo: googleData.photos.length > 0 ? googleData.photos[0] : null, 
-                lat: googleData.lat,
-                lng: googleData.lng,
-                aiSummary,
-            };
-        });
-
-        res.json(finalResults);
-    } catch (err) {
-        // Pass the error to the Express error handler
-        next(err); 
+      finalLat = (fromCoords.lat + toCoords.lat) / 2;
+      finalLng = (fromCoords.lng + toCoords.lng) / 2;
+      finalDistanceKm = fromToDistanceKm / 2 + 50;
     }
+
+    // 📍 2️⃣ USER LOCATION SEARCH
+    else if (userLat && userLng) {
+      isGeoSearch = true;
+      finalLat = parseFloat(userLat);
+      finalLng = parseFloat(userLng);
+      finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+    }
+
+    // 🧭 3️⃣ LOCATION NAME SEARCH
+    else if (locationName) {
+      isGeoSearch = true;
+      const coords = await googleService.getCoordinatesByPlaceName(locationName);
+      finalLat = coords.lat;
+      finalLng = coords.lng;
+      finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+    }
+
+    // 🏙️ 4️⃣ CITY / STATE / ZIP FILTERS
+    if (city) matchQuery.city_town = new RegExp(city, "i");
+    if (state) matchQuery.state = state.toUpperCase();
+    if (zip) matchQuery.zip_code = zip;
+
+    // 🏠 5️⃣ OWNERSHIP TYPE
+    if (ownership) {
+      const ownershipArray = ownership.split(",").map((o: string) => o.trim());
+      matchQuery.ownership_type = { $in: ownershipArray };
+    }
+
+    // 🛏️ 6️⃣ BEDS RANGE FILTER
+    if (bedsMin || bedsMax) {
+      matchQuery.number_of_certified_beds = {};
+      if (bedsMin) matchQuery.number_of_certified_beds.$gte = parseInt(bedsMin);
+      if (bedsMax) matchQuery.number_of_certified_beds.$lte = parseInt(bedsMax);
+    }
+
+    // 🌎 7️⃣ GEO FILTER (optional)
+    if (isGeoSearch && finalLat && finalLng) {
+      pipeline.push({
+        $geoNear: {
+          near: { type: "Point", coordinates: [finalLng, finalLat] },
+          distanceField: "distance_m",
+          key: "geoLocation",
+          maxDistance: (finalDistanceKm || 20) * 1000, // meters
+          spherical: true,
+          query: matchQuery,
+        },
+      });
+    } else {
+      pipeline.push({ $match: matchQuery });
+    }
+
+    // ⭐ 8️⃣ RATING FILTER
+    const ratingMinNum = ratingMin ? parseInt(ratingMin) : null;
+    if (ratingMinNum && ratingMinNum >= 1 && ratingMinNum <= 5) {
+      pipeline.push({
+        $addFields: {
+          numeric_overall_rating: {
+            $cond: {
+              if: {
+                $and: [
+                  { $ifNull: ["$overall_rating", false] },
+                  { $ne: ["$overall_rating", ""] },
+                ],
+              },
+              then: { $toDouble: "$overall_rating" },
+              else: 0,
+            },
+          },
+        },
+      });
+
+      pipeline.push({
+        $match: { numeric_overall_rating: { $gte: ratingMinNum } },
+      });
+    }
+
+    // 🚀 EXECUTE QUERY (no limit)
+    const facilities = await Facility.aggregate(pipeline);
+    console.log(`✅ Found ${facilities.length} facilities`);
+
+    // 🧠 GOOGLE PLACE DATA
+    const googleResults = await Promise.all(
+      facilities.map((f: any) => fetchAndCacheGoogleData(f))
+    );
+
+    const finalResults = facilities.map((f: any, i: number) => {
+      const g = googleResults[i];
+      return {
+        ...f,
+        distance_km: f.distance_m ? f.distance_m / 1000 : null,
+        googleName: g?.googleName,
+        rating: g?.rating,
+        photo: g?.photos?.[0] || null,
+        lat: g?.lat || f.latitude,
+        lng: g?.lng || f.longitude,
+        aiSummary: { summary: "", pros: [], cons: [] },
+      };
+    });
+
+    // 📦 RESPONSE
+    const response: any = { facilities: finalResults };
+    if (fromLocation && toLocation) {
+      response.fromLocation = fromLocation;
+      response.toLocation = toLocation;
+      response.fromToDistanceKm = fromToDistanceKm;
+    } else if (isGeoSearch && finalLat && finalLng) {
+      response.centerCoords = { lat: finalLat, lng: finalLng };
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error("❌ Error in filterFacilitiesWithReviews:", err);
+    next(err);
+  }
 };
 
-// const fetchAndCacheGoogleData = async (facility: any) => {
-//     const cache = facility.googleCache;
-//     const now = new Date();
-//     const CACHE_LIFETIME = 30 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
 
-//     // 💡 CACHE CHECK: If cache is fresh, return it immediately
-//     if (cache && cache.lastUpdated && (now.getTime() - cache.lastUpdated.getTime()) < CACHE_LIFETIME) {
-//         return {
-//             googleName: cache.googleName,
-//             rating: cache.rating,
-//             lat: cache.lat,
-//             lng: cache.lng,
-//             photo: cache.photoReference ? googleService.getPhotoUrl(cache.photoReference) : null,
-//         };
-//     }
-
-//     // Cache is missing or stale, proceed with expensive API calls
-//     try {
-//         // FIX: Use correct schema field names (provider_name, zip_code, city_town)
-//         let placeId =
-//             (await googleService.findPlaceIdByText(facility.provider_name)) ||
-//             (await googleService.findPlaceIdByText(`${facility.provider_name} ${facility.zip_code}`)) ||
-//             (await googleService.findPlaceIdByText(`${facility.provider_name} ${facility.city_town}`));
-
-//         if (placeId) {
-//             const details = await googleService.getPlaceDetails(placeId);
-//             if (details) {
-//                 const newCache = {
-//                     placeId,
-//                     googleName: details.name,
-//                     rating: details.rating,
-//                     lat: details.lat,
-//                     lng: details.lng,
-//                     photoReference: details.photos.length ? details.photos[0].photo_reference : null,
-//                     lastUpdated: now
-//                 };
-
-//                 // 💡 CACHING: Update MongoDB document in the background
-//                 Facility.findOneAndUpdate(
-//                     { _id: facility._id }, 
-//                     { $set: { googleCache: newCache } }
-//                 ).exec().catch(err => console.error(`Cache update failed for ${facility._id}:`, err));
-
-//                 return {
-//                     googleName: newCache.googleName,
-//                     rating: newCache.rating,
-//                     lat: newCache.lat,
-//                     lng: newCache.lng,
-//                     photo: newCache.photoReference ? googleService.getPhotoUrl(newCache.photoReference) : null,
-//                 };
-//             }
-//         }
-//     } catch (err) {
-//         console.error(`Google fetch failed for ${facility.provider_name}:`, err);
-//     }
-
-//     return { googleName: null, rating: null, lat: null, lng: null, photo: null };
-// };
-
-
-// export const searchFacilitiesWithReviews = async (
-//     req: Request,
-//     res: Response,
-//     next: NextFunction
-// ) => {
-//     try {
-//         const { city, state, zip } = req.query as {
-//             city?: string;
-//             state?: string;
-//             zip?: string;
-//         };
-
-//         // FIX: Mongo query must use schema field names (city_town, zip_code)
-//         const query: any = {};
-//         if (city) query.city_town = new RegExp(city, "i");
-//         if (state) query.state = state.toUpperCase();
-//         if (zip) query.zip_code = zip;
-
-//         // 💡 OPTIMIZATION 1: Use .lean() for faster object retrieval
-//         const facilities = await Facility.find(query).limit(10).lean(); 
-
-//         // 💡 OPTIMIZATION 2: Execute all 10 cache/API operations in PARALLEL using Promise.all
-//         const googlePromises = facilities.map(f => fetchAndCacheGoogleData(f));
-//         const googleResults = await Promise.all(googlePromises);
-
-//         // Merge the results
-//         const finalResults = facilities.map((f, index) => {
-//             const googleData = googleResults[index];
-//             const aiSummary = { summary: "", pros: [], cons: [] }; // Placeholder for AI
-
-//             return {
-//                 ...f, 
-//                 googleName: googleData.googleName,
-//                 rating: googleData.rating,
-//                 photo: googleData.photo,
-//                 lat: googleData.lat,
-//                 lng: googleData.lng,
-//                 aiSummary,
-//             };
-//         });
-
-//         res.json(finalResults);
-//     } catch (err) {
-//         next(err); 
-//     }
-// };
 
 export const searchFacilities = async (req: Request, res: Response, next: NextFunction) => {
   try {

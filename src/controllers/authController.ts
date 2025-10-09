@@ -12,7 +12,7 @@ interface JwtPayload {
 // REGISTER
 export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password, role } = req.body;
+    const { name, email, password, role } = req.body;
 
     // Check existing user
     const existingUser = await User.findOne({ email });
@@ -22,6 +22,7 @@ export const register = async (req: Request, res: Response) => {
 
     // Create user (password hashing is handled by the pre-save hook in the model)
     const user = new User({
+      name,
       email,
       password: password, // The plain password before the hook runs
       role: role || 'user',
