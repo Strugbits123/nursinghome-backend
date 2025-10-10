@@ -14,6 +14,7 @@ import { getCache, setCache } from "../config/redisClient";
 
 // Get your API key from environment variables
 
+const CACHE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 const CMS_API_URL =
   "https://data.cms.gov/provider-data/api/1/datastore/query/4pq5-n9py/0";
@@ -33,155 +34,366 @@ const SEARCH_CACHE_KEY = (query: { lat?: string; lng?: string; q?: string }) => 
     return 'search:invalid';
 };
 
-// export const searchFacilitiesWithReviews = async (
-//   req: Request,
-//   res: Response,
-//   next: NextFunction
-// ) => {
-//   try {
-//     const { city, state, zip } = req.query as {
-//       city?: string;
-//       state?: string;
-//       zip?: string;
-//     };
 
-//     // Mongo query
-//     const query: any = {};
-//     if (city) query.city = new RegExp(city, "i");
-//     if (state) query.state = state.toUpperCase();
-//     if (zip) query.zip = zip;
+// const fetchAndCacheGoogleData = async (facility: any) => {
+//     const cache = facility.googleCache;
+//     const now = new Date();
+//     const CACHE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
 
-//     const facilities = await Facility.find(query).limit(10);
-
-//     const results = [];
-//     for (const f of facilities) {
-//       let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] };
-//       let photo: string | null = null;
-//       let lat: number | null = null;
-//       let lng: number | null = null;
-//       let googleName: string | null = null;
-//       let rating: number | null = null;
-
-//       try {
-//         // 🔹 Try multiple queries to get placeId
-//         let placeId =
-//           (await googleService.findPlaceIdByText(f.name)) ||
-//           (await googleService.findPlaceIdByText(`${f.name} ${f.zip}`)) ||
-//           (await googleService.findPlaceIdByText(`${f.name} ${f.city}`));
-
-//         console.log("Searching Place:", f.name, "=> placeId:", placeId);
-
-//         if (placeId) {
-//           const details = await googleService.getPlaceDetails(placeId);
-//           if (details) {
-//             googleName = details.name;
-//             rating = details.rating;
-//             lat = details.lat;
-//             lng = details.lng;
-
-//             // first photo
-//             if (details.photos.length) {
-//               photo = googleService.getPhotoUrl(details.photos[0].photo_reference);
-//             }
-
-//             // summarize reviews via AI
-//             // const reviewsText = details.reviews.map((r) => r.text).join("\n");
-//             // if (reviewsText) {
-//             //   aiSummary = await summarizeReviews(reviewsText);
-//             // }
-//           }
-//         }
-//       } catch (err) {
-//         console.error(`Google fetch failed for ${f.name}:`, err);
-//       }
-
-//       results.push({
-//         ...f.toObject(),
-//         googleName,
-//         rating,
-//         photo,
-//         lat,
-//         lng,
-//         aiSummary,
-//       });
+//     // 💡 CACHE CHECK: If cache is fresh, return it immediately
+//     if (cache && cache.lastUpdated && (now.getTime() - cache.lastUpdated.getTime()) < CACHE_LIFETIME) {
+//         // Return array of photos and reviews from cache
+//         const photoUrls = cache.photoReferences.map((ref: string) => googleService.getPhotoUrl(ref));
+        
+//         return {
+//             googleName: cache.googleName,
+//             rating: cache.rating,
+//             lat: cache.lat,
+//             lng: cache.lng,
+//             photos: photoUrls, // Multiple photos from cache
+//             reviews: cache.reviews, // Reviews from cache
+//         };
 //     }
 
-//     res.json(results);
-//   } catch (err) {
-//     next(err);
-//   }
+//     // Cache is missing or stale, proceed with expensive API calls
+//     try {
+//         let placeId =
+//             (await googleService.findPlaceIdByText(facility.provider_name)) ||
+//             (await googleService.findPlaceIdByText(`${facility.provider_name} ${facility.zip_code}`)) ||
+//             (await googleService.findPlaceIdByText(`${facility.provider_name} ${facility.city_town}`));
+
+//         if (placeId) {
+//             const details = await googleService.getPlaceDetails(placeId);
+//             if (details) {
+//                 // 💡 NEW LOGIC: Get top 4 photo references and all reviews
+//                 const photoReferences = details.photos 
+//                     ? details.photos.slice(0, 4).map((p: any) => p.photo_reference) 
+//                     : [];
+//                 const photoUrls = photoReferences.map((ref: string) => googleService.getPhotoUrl(ref));
+//                 const reviews = details.reviews || [];
+
+//                 const newCache = {
+//                     placeId,
+//                     googleName: details.name,
+//                     rating: details.rating,
+//                     lat: details.lat,
+//                     lng: details.lng,
+//                     photoReferences, // Store array of references
+//                     reviews, // Store array of reviews
+//                     lastUpdated: now
+//                 };
+                
+//                 // Update MongoDB document in the background
+//                 Facility.findOneAndUpdate(
+//                     { _id: facility._id }, 
+//                     { $set: { googleCache: newCache } }
+//                 ).exec().catch(err => console.error(`Cache update failed for ${facility._id}:`, err));
+
+//                 return {
+//                     googleName: newCache.googleName,
+//                     rating: newCache.rating,
+//                     lat: newCache.lat,
+//                     lng: newCache.lng,
+//                     photos: photoUrls,
+//                     reviews: reviews, 
+//                   };
+//             }
+//         }
+//     } catch (err) {
+//         console.error(`Google fetch failed for ${facility.provider_name}:`, err);
+//     }
+
+//     return { googleName: null, rating: null, lat: null, lng: null, photos: [], reviews: [] };
 // };
 
+
+
 const fetchAndCacheGoogleData = async (facility: any) => {
-    const cache = facility.googleCache;
-    const now = new Date();
-    const CACHE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
+  const now = new Date();
+  const REDIS_KEY = `facility:${facility._id}:google`;
 
-    // 💡 CACHE CHECK: If cache is fresh, return it immediately
-    if (cache && cache.lastUpdated && (now.getTime() - cache.lastUpdated.getTime()) < CACHE_LIFETIME) {
-        // Return array of photos and reviews from cache
-        const photoUrls = cache.photoReferences.map((ref: string) => googleService.getPhotoUrl(ref));
-        
-        return {
-            googleName: cache.googleName,
-            rating: cache.rating,
-            lat: cache.lat,
-            lng: cache.lng,
-            photos: photoUrls, // Multiple photos from cache
-            reviews: cache.reviews, // Reviews from cache
-        };
+  try {
+    // 1️⃣ Try Redis first
+    const redisData = await getCache(REDIS_KEY);
+    if (redisData) {
+      const parsed = JSON.parse(redisData);
+
+      // 🔄 Check if stale (older than 30 days)
+      const lastUpdated = new Date(parsed.lastUpdated || 0);
+      const isStale = now.getTime() - lastUpdated.getTime() > CACHE_LIFETIME_MS;
+
+      if (isStale) {
+        // 🔁 Refresh in background (non-blocking)
+        refreshGoogleDataInBackground(facility, REDIS_KEY);
+      }
+
+      // ✅ Return current cached data immediately
+      return {
+        googleName: parsed.googleName,
+        rating: parsed.rating,
+        lat: parsed.lat,
+        lng: parsed.lng,
+        photos: parsed.photoReferences.map((ref: string) =>
+          googleService.getPhotoUrl(ref)
+        ),
+        reviews: parsed.reviews,
+      };
     }
 
-    // Cache is missing or stale, proceed with expensive API calls
-    try {
-        let placeId =
-            (await googleService.findPlaceIdByText(facility.provider_name)) ||
-            (await googleService.findPlaceIdByText(`${facility.provider_name} ${facility.zip_code}`)) ||
-            (await googleService.findPlaceIdByText(`${facility.provider_name} ${facility.city_town}`));
+    // 2️⃣ Try MongoDB cache next
+    const mongoCache = facility.googleCache;
+    if (mongoCache && mongoCache.lastUpdated) {
+      const lastUpdated = new Date(mongoCache.lastUpdated);
+      const isStale = now.getTime() - lastUpdated.getTime() > CACHE_LIFETIME_MS;
 
-        if (placeId) {
-            const details = await googleService.getPlaceDetails(placeId);
-            if (details) {
-                // 💡 NEW LOGIC: Get top 4 photo references and all reviews
-                const photoReferences = details.photos 
-                    ? details.photos.slice(0, 4).map((p: any) => p.photo_reference) 
-                    : [];
-                const photoUrls = photoReferences.map((ref: string) => googleService.getPhotoUrl(ref));
-                const reviews = details.reviews || [];
+      // Rebuild photo URLs
+      const photoUrls = mongoCache.photoReferences.map((ref: string) =>
+        googleService.getPhotoUrl(ref)
+      );
 
-                const newCache = {
-                    placeId,
-                    googleName: details.name,
-                    rating: details.rating,
-                    lat: details.lat,
-                    lng: details.lng,
-                    photoReferences, // Store array of references
-                    reviews, // Store array of reviews
-                    lastUpdated: now
-                };
-                
-                // Update MongoDB document in the background
-                Facility.findOneAndUpdate(
-                    { _id: facility._id }, 
-                    { $set: { googleCache: newCache } }
-                ).exec().catch(err => console.error(`Cache update failed for ${facility._id}:`, err));
+      // Cache it in Redis for faster next time
+      await setCache(REDIS_KEY, JSON.stringify(mongoCache));
 
-                return {
-                    googleName: newCache.googleName,
-                    rating: newCache.rating,
-                    lat: newCache.lat,
-                    lng: newCache.lng,
-                    photos: photoUrls,
-                    reviews: reviews, 
-                  };
-            }
-        }
-    } catch (err) {
-        console.error(`Google fetch failed for ${facility.provider_name}:`, err);
+      // If stale → background refresh
+      if (isStale) {
+        refreshGoogleDataInBackground(facility, REDIS_KEY);
+      }
+
+      return {
+        googleName: mongoCache.googleName,
+        rating: mongoCache.rating,
+        lat: mongoCache.lat,
+        lng: mongoCache.lng,
+        photos: photoUrls,
+        reviews: mongoCache.reviews,
+      };
     }
 
-    return { googleName: null, rating: null, lat: null, lng: null, photos: [], reviews: [] };
+    // 3️⃣ If nothing in Redis or Mongo — fetch fresh from Google
+    return await refreshGoogleDataInBackground(facility, REDIS_KEY, true);
+  } catch (err) {
+    console.error(`Google fetch failed for ${facility.provider_name}:`, err);
+  }
+
+  // 4️⃣ Fallback
+  return {
+    googleName: null,
+    rating: null,
+    lat: null,
+    lng: null,
+    photos: [],
+    reviews: [],
+  };
 };
+
+
+/**
+ * 🔁 Helper — refreshes Google data and updates Redis + Mongo
+ * @param facility Facility object
+ * @param REDIS_KEY Redis cache key
+ * @param immediateReturn If true, return the fetched data; else run in background
+ */
+async function refreshGoogleDataInBackground(
+  facility: any,
+  REDIS_KEY: string,
+  immediateReturn: boolean = false
+) {
+  try {
+    const placeIdResults = await Promise.allSettled([
+      googleService.findPlaceIdByText(facility.provider_name),
+      googleService.findPlaceIdByText(`${facility.provider_name} ${facility.zip_code}`),
+      googleService.findPlaceIdByText(`${facility.provider_name} ${facility.city_town}`),
+    ]);
+
+    const fulfilledResults = placeIdResults.filter(
+      (r): r is PromiseFulfilledResult<string | null> => r.status === "fulfilled"
+    );
+
+    const placeId = fulfilledResults.find((r) => r.value)?.value;
+    if (!placeId) return null;
+
+    const details = await googleService.getPlaceDetails(placeId);
+    if (!details) return null;
+
+    const photoReferences = details.photos
+      ? details.photos.slice(0, 4).map((p: any) => p.photo_reference)
+      : [];
+
+    const reviews = (details.reviews || []).slice(0, 10).map((r: any) => ({
+      author_name: r.author_name,
+      rating: r.rating,
+      text: r.text,
+      time: r.time,
+    }));
+
+    const now = new Date();
+    const newCache = {
+      placeId,
+      googleName: details.name,
+      rating: details.rating,
+      lat: details.lat,
+      lng: details.lng,
+      photoReferences,
+      reviews,
+      lastUpdated: now,
+    };
+
+    // 🧠 Save to both Redis and Mongo
+    await Promise.allSettled([
+      setCache(REDIS_KEY, JSON.stringify(newCache)),
+      Facility.updateOne(
+        { _id: facility._id },
+        { $set: { googleCache: newCache } },
+        { upsert: true }
+      ),
+    ]);
+
+    if (immediateReturn) {
+      return {
+        googleName: newCache.googleName,
+        rating: newCache.rating,
+        lat: newCache.lat,
+        lng: newCache.lng,
+        photos: photoReferences.map((ref) => googleService.getPhotoUrl(ref)),
+        reviews,
+      };
+    }
+  } catch (err) {
+    console.error(`Background refresh failed for ${facility.provider_name}:`, err);
+  }
+
+  return null;
+}
+
+
+
+// const fetchAndCacheGoogleData = async (facility: any) => {
+//   const now = new Date();
+//   const CACHE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+//   const REDIS_KEY = `facility:${facility._id}:google`;
+
+//   try {
+//     // 1️⃣ Try Redis first
+//     const redisData = await getCache(REDIS_KEY);
+//     if (redisData) {
+//       const parsed = JSON.parse(redisData);
+//       return {
+//         googleName: parsed.googleName,
+//         rating: parsed.rating,
+//         lat: parsed.lat,
+//         lng: parsed.lng,
+//         photos: parsed.photoReferences.map((ref: string) =>
+//           googleService.getPhotoUrl(ref)
+//         ),
+//         reviews: parsed.reviews,
+//       };
+//     }
+
+//     // 2️⃣ Try MongoDB cache next
+//     const mongoCache = facility.googleCache;
+//     if (
+//       mongoCache &&
+//       mongoCache.lastUpdated &&
+//       now.getTime() - new Date(mongoCache.lastUpdated).getTime() <
+//         CACHE_LIFETIME_MS
+//     ) {
+//       const photoUrls = mongoCache.photoReferences.map((ref: string) =>
+//         googleService.getPhotoUrl(ref)
+//       );
+
+//       // Store in Redis for next time
+//       await setCache(
+//         REDIS_KEY,
+//         JSON.stringify(mongoCache),
+//         30 * 24 * 60 * 60 // 30 days
+//       );
+
+//       return {
+//         googleName: mongoCache.googleName,
+//         rating: mongoCache.rating,
+//         lat: mongoCache.lat,
+//         lng: mongoCache.lng,
+//         photos: photoUrls,
+//         reviews: mongoCache.reviews,
+//       };
+//     }
+
+//     // 3️⃣ Cache missing or stale — fetch from Google
+//     const placeIdResults = await Promise.allSettled([
+//       googleService.findPlaceIdByText(facility.provider_name),
+//       googleService.findPlaceIdByText(
+//         `${facility.provider_name} ${facility.zip_code}`
+//       ),
+//       googleService.findPlaceIdByText(
+//         `${facility.provider_name} ${facility.city_town}`
+//       ),
+//     ]);
+
+//     const placeId = placeIdResults.find(
+//       (r) => r.status === "fulfilled" && r.value
+//     )?.value;
+
+//     if (placeId) {
+//       const details = await googleService.getPlaceDetails(placeId);
+//       if (details) {
+//         const photoReferences = details.photos
+//           ? details.photos.slice(0, 4).map((p: any) => p.photo_reference)
+//           : [];
+//         const reviews = (details.reviews || []).slice(0, 10).map((r: any) => ({
+//           author_name: r.author_name,
+//           rating: r.rating,
+//           text: r.text,
+//           time: r.time,
+//         }));
+
+//         const newCache = {
+//           placeId,
+//           googleName: details.name,
+//           rating: details.rating,
+//           lat: details.lat,
+//           lng: details.lng,
+//           photoReferences,
+//           reviews,
+//           lastUpdated: now,
+//         };
+
+//         // 4️⃣ Save to Redis and MongoDB in background
+//         await Promise.allSettled([
+//           setCache(REDIS_KEY, JSON.stringify(newCache)),
+//           Facility.updateOne(
+//             { _id: facility._id },
+//             { $set: { googleCache: newCache } },
+//             { upsert: true }
+//           ),
+//         ]);
+
+//         return {
+//           googleName: newCache.googleName,
+//           rating: newCache.rating,
+//           lat: newCache.lat,
+//           lng: newCache.lng,
+//           photos: photoReferences.map((ref) =>
+//             googleService.getPhotoUrl(ref)
+//           ),
+//           reviews,
+//         };
+//       }
+//     }
+//   } catch (err) {
+//     console.error(`Google fetch failed for ${facility.provider_name}:`, err);
+//   }
+
+//   // 5️⃣ Fallback response
+//   return {
+//     googleName: null,
+//     rating: null,
+//     lat: null,
+//     lng: null,
+//     photos: [],
+//     reviews: [],
+//   };
+// };
+
 
 // Get Facility Details
 export const getFacilityDetails = async (

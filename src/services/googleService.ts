@@ -1,4 +1,3 @@
-// src/services/googleService.ts
 import axios from "axios";
 
 const apiKey = process.env.GOOGLE_API_KEY || "";
