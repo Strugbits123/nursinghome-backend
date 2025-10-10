@@ -396,59 +396,79 @@ async function refreshGoogleDataInBackground(
 
 
 // Get Facility Details
+// ✅ Get Facility Details (Type-safe & Stable)
 export const getFacilityDetails = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
+  req: Request,
+  res: Response,
+  next: NextFunction
 ) => {
-    try {
-        const { name } = req.query as { name: string };
-        if (!name) {
-            return res.status(400).json({ message: "Facility name is required." });
-        }
-        
-        const safeName = name.trim();
-        const firstWord = safeName.split(/\s+/)[0];
-        const escapedPrefix = firstWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const searchPrefix = escapedPrefix;
-        const facility = await Facility.findOne({
-          provider_name: { $regex: `^${searchPrefix}`, $options: "i" }
-        })
-        .sort({ provider_name: 1 }) 
-        .lean();
+  try {
+    const { name } = req.query as { name?: string };
 
-        if (!facility) {
-          console.log(`[DETAIL DEBUG] No facilities found with prefix: ${searchPrefix}`);
-          return res.status(404).json({ message: "Facility not found." });
-        }
-  
-        
-        const googleData = await fetchAndCacheGoogleData(facility);
-        
-        
-        let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] }; 
-
-        const reviewsText = googleData.reviews ? googleData.reviews.map((r: any) => r.text).join("\n") : "";
-
-        if (reviewsText) {
-            aiSummary = await summarizeReviews(reviewsText);
-        }
-        
-        res.json({
-            ...facility, 
-            googleName: googleData.googleName,
-            rating: googleData.rating,
-            photos: googleData.photos,
-            reviews: googleData.reviews,
-            lat: googleData.lat,
-            lng: googleData.lng,
-            aiSummary,
-        });
-
-    } catch (err) {
-        next(err); 
+    if (!name) {
+      return res.status(400).json({ message: "Facility name is required." });
     }
+
+    const safeName = name.trim();
+    const firstWord = safeName.split(/\s+/)[0];
+    const escapedPrefix = firstWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const searchPrefix = escapedPrefix;
+
+    const facility = await Facility.findOne({
+      provider_name: { $regex: `^${searchPrefix}`, $options: "i" },
+    })
+      .sort({ provider_name: 1 })
+      .lean();
+
+    if (!facility) {
+      console.log(`[DETAIL DEBUG] No facilities found with prefix: ${searchPrefix}`);
+      return res.status(404).json({ message: "Facility not found." });
+    }
+
+    // ✅ Fetch Google data safely
+    const googleData = (await fetchAndCacheGoogleData(facility)) ?? {
+      googleName: null,
+      rating: null,
+      lat: null,
+      lng: null,
+      photos: [],
+      reviews: [],
+    };
+
+    // ✅ Safe default AI summary
+    let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] };
+
+    // ✅ Safely extract review text (no TS18047)
+    const reviewsText = googleData.reviews?.length
+      ? googleData.reviews.map((r: any) => r.text).join("\n")
+      : "";
+
+    // ✅ Only summarize if reviews exist
+    if (reviewsText) {
+      try {
+        aiSummary = await summarizeReviews(reviewsText);
+      } catch (err) {
+        console.error("⚠️ AI Summary failed:", err);
+      }
+    }
+
+    // ✅ Respond with combined facility + Google data
+    res.json({
+      ...facility,
+      googleName: googleData.googleName ?? null,
+      rating: googleData.rating ?? null,
+      photos: googleData.photos ?? [],
+      reviews: googleData.reviews ?? [],
+      lat: googleData.lat ?? null,
+      lng: googleData.lng ?? null,
+      aiSummary,
+    });
+  } catch (err) {
+    console.error("❌ Error in getFacilityDetails:", err);
+    next(err);
+  }
 };
+
 
 
 // ✅ Map of states (Full Name → Abbreviation)
@@ -480,7 +500,6 @@ function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: str
   // Otherwise, treat as city
   return { type: "city", value: q };
 }
-
 // ✅ Controller
 export const searchFacilitiesWithReviews = async (
   req: Request,
@@ -488,17 +507,17 @@ export const searchFacilitiesWithReviews = async (
   next: NextFunction
 ) => {
   try {
-     const { lat, lng, q } = req.query as { lat?: string; lng?: string; q?: string };
-     const cacheKey = SEARCH_CACHE_KEY(req.query as { lat?: string; lng?: string; q?: string });
+    const { lat, lng, q } = req.query as { lat?: string; lng?: string; q?: string };
+    const cacheKey = SEARCH_CACHE_KEY(req.query as { lat?: string; lng?: string; q?: string });
 
     // --- 1. REDIS CACHE CHECK ---
     if (cacheKey !== 'search:invalid') {
-        const cachedResult = await getCache(cacheKey);
-        if (cachedResult) {
-            console.log(`✅ CACHE HIT for search key: ${cacheKey}`);
-            return res.status(200).json(JSON.parse(cachedResult));
-        }
-        console.log(`❌ CACHE MISS for search key: ${cacheKey}`);
+      const cachedResult = await getCache(cacheKey);
+      if (cachedResult) {
+        console.log(`✅ CACHE HIT for search key: ${cacheKey}`);
+        return res.status(200).json(JSON.parse(cachedResult));
+      }
+      console.log(`❌ CACHE MISS for search key: ${cacheKey}`);
     }
 
     // ✅ Case 1: Search by coordinates (nearby)
@@ -521,14 +540,10 @@ export const searchFacilitiesWithReviews = async (
         },
       }).limit(50);
 
-      // --- 2. CACHE SET FOR NEARBY SEARCH (30 DAYS) ---
       if (nearbyFacilities.length > 0) {
-        await setCache(
-            cacheKey, 
-            JSON.stringify(nearbyFacilities), 
-            SEARCH_CACHE_TTL_SECONDS
-        );
+        await setCache(cacheKey, JSON.stringify(nearbyFacilities), SEARCH_CACHE_TTL_SECONDS);
       }
+
       return res.status(200).json(nearbyFacilities);
     }
 
@@ -538,11 +553,9 @@ export const searchFacilitiesWithReviews = async (
 
     const safeQuery = q.trim();
     const { type, value } = normalizeQuery(safeQuery);
-
     console.log("🔍 Detected:", type, "| Normalized Value:", value);
 
     const mongoQuery: any = {};
-
     if (type === "zip") {
       mongoQuery.zip_code = value;
     } else if (type === "state") {
@@ -553,7 +566,7 @@ export const searchFacilitiesWithReviews = async (
 
     // Fetch facilities from MongoDB
     const facilities = await Facility.find(mongoQuery).lean();
-    
+
     if (!facilities || facilities.length === 0) {
       return res.status(200).json([]);
     }
@@ -563,20 +576,24 @@ export const searchFacilitiesWithReviews = async (
       facilities.map((facility) => fetchAndCacheGoogleData(facility))
     );
 
-    // ✅ Process AI summaries in parallel (safe)
+    // ✅ Process AI summaries safely
     const finalResults = await Promise.all(
       facilities.map(async (facility, index) => {
-        const googleData = googleResults[index];
+        const googleData = googleResults[index] ?? {
+          googleName: null,
+          rating: null,
+          lat: null,
+          lng: null,
+          photos: [],
+          reviews: [],
+        };
 
-        // Default structure
         let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] };
 
-        // ✅ Extract review text safely
-        const reviewsText = googleData.reviews
+        const reviewsText = googleData.reviews?.length
           ? googleData.reviews.map((r: any) => r.text).join("\n")
           : "";
 
-        // ✅ Conditionally generate AI summary
         if (reviewsText) {
           try {
             aiSummary = await summarizeReviews(reviewsText);
@@ -585,26 +602,21 @@ export const searchFacilitiesWithReviews = async (
           }
         }
 
-        // ✅ Return merged final object
         return {
           ...facility,
-          googleName: googleData.googleName,
-          rating: googleData.rating,
+          googleName: googleData.googleName ?? null,
+          rating: googleData.rating ?? null,
           photo: googleData.photos?.[0] || null,
-          lat: googleData.lat,
-          lng: googleData.lng,
+          lat: googleData.lat ?? null,
+          lng: googleData.lng ?? null,
           aiSummary,
         };
       })
     );
 
-     // --- 3. CACHE SET FOR TEXT SEARCH (30 DAYS) ---
+    // --- 3. CACHE SET FOR TEXT SEARCH (30 DAYS) ---
     if (finalResults.length > 0) {
-        await setCache(
-            cacheKey, 
-            JSON.stringify(finalResults), 
-            SEARCH_CACHE_TTL_SECONDS
-        );
+      await setCache(cacheKey, JSON.stringify(finalResults), SEARCH_CACHE_TTL_SECONDS);
     }
 
     res.status(200).json(finalResults);
