@@ -26,15 +26,15 @@ import { getCache, setCache } from "./config/redisClient";
 // import "./cron/facilityCron";
 
 const app: Application = express();
-// const corsOptions = {
-//     origin: 'http://localhost:3000', 
-//     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
-//     allowedHeaders: 'Content-Type,Authorization', 
-//     credentials: true, 
-// };
+const corsOptions = {
+    origin: 'https://carenav.io/', 
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    allowedHeaders: 'Content-Type,Authorization', 
+    credentials: true, 
+};
 
 // 2. Apply the CORS middleware
-// app.use(cors(corsOptions));
+app.use(cors(corsOptions));
 app.use(cors());
 app.use(express.json());
 
