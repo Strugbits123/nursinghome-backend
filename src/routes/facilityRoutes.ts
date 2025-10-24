@@ -1,4 +1,3 @@
-import { Router } from "express";
 import {
   searchFacilities,
   getFacilityById,
@@ -8,9 +7,19 @@ import {
   filterFacilitiesWithReviews
 } from "../controllers/facilityController";
 import { protect } from "../middleware/authMiddleware";
+import { Router, Request, Response, NextFunction } from "express";
 
 const router = Router();
-router.get("/with-reviews", searchFacilitiesWithReviews);
+// Middleware to disable browser caching
+const noCacheMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  res.set("Cache-Control", "no-store");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  next();
+};
+
+// Apply middleware to this route
+router.get("/with-reviews", noCacheMiddleware, searchFacilitiesWithReviews);
 router.get('/details', getFacilityDetails); 
 router.get("/filter-with-reviews", filterFacilitiesWithReviews);
 

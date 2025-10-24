@@ -4,7 +4,7 @@ const ReviewSchema = new Schema({
     author_name: { type: String }, 
     rating: { type: Number }, 
     text: { type: String }, 
-    time: { type: Number }, // Optional: Include review timestamp if available from Google
+    time: { type: Number },
 }, { _id: false });
 
 export const GoogleDetailsSchema = new Schema({
@@ -14,19 +14,13 @@ export const GoogleDetailsSchema = new Schema({
     rating: { type: Number },
     lat: { type: Number },
     lng: { type: Number },
-    
-    // Multiple Photos (References only, URLs generated in controller)
     photoReferences: [{ type: String }], 
-    
-    // Reviews
     reviews: [ReviewSchema], 
-    
     // Cache Management
-    lastUpdated: { type: Date, default: Date.now, expires: '30d' }, // Data expires 30 days after creation
+    lastUpdated: { type: Date, default: Date.now, expires: '30d' },
 }, { _id: false });
 
 
-// Define the TypeScript Interface for the Document Fields
 export interface INursingFacility extends Document {
   cms_certification_number_ccn: string;
   provider_name: string | null;
@@ -127,11 +121,12 @@ export interface INursingFacility extends Document {
   latitude: number | null;
   longitude: number | null;
   geocoding_footnote: string | null;
-  geoLocation: {
-    type: string;
-    coordinates: number[];
-  };
   processing_date: Date | null;
+  rating?: number;
+  geoLocation: {
+    type: 'Point';
+    coordinates: [number, number];
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -235,27 +230,18 @@ const NursingFacilitySchema = new Schema<INursingFacility>({
   location: { type: String },
   latitude: { type: Number },
   longitude: { type: Number },
-  geoLocation: {
-      type: {
-        type: String,
-        enum: ["Point"],
-        default: "Point",
-      },
-      coordinates: {
-        type: [Number], // [longitude, latitude]
-        index: "2dsphere",
-      },
-    },
   geocoding_footnote: { type: String },
+  geoLocation: {
+    type: { type: String, enum: ['Point'], required: true },
+    coordinates: { type: [Number], required: true }
+  },
   processing_date: { type: Date },
+    rating: { type: Number, default: null },
+
 }, { timestamps: true });
-NursingFacilitySchema.index({ geoLocation: "2dsphere" });
 
+NursingFacilitySchema.index({ geoLocation: '2dsphere' });
 
-
-const NursingFacility = mongoose.model<INursingFacility>(
-  "NursingFacility",
-  NursingFacilitySchema
-);
+const NursingFacility = mongoose.model<INursingFacility>("NursingFacility", NursingFacilitySchema, "nursingfacilities");
 
 export default NursingFacility;

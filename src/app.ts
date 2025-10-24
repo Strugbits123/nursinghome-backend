@@ -20,6 +20,8 @@ import Facility from './models/NursingFacility';
 
 import { startFacilitySyncCron } from './cron/syncJob';
 
+import { getCache, setCache } from "./config/redisClient";
+
 // Cron jobs
 // import "./cron/facilityCron";
 
@@ -53,6 +55,18 @@ app.use("/api/google", googleRoutes);
 
 app.use("/api/place", placeRoutes);
 
+app.get("/api/debug/cache/:key", async (req, res) => {
+  const { key } = req.params;
+  try {
+    const value = await getCache(key);
+    if (!value) return res.status(404).json({ message: "Key not found" });
+    return res.json(JSON.parse(value));
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Unexpected error";
+    res.status(500).json({ error: message });
+  }
+});
+
 
 app.use(errorHandler);
 console.log("MONGO_URI from env:", JSON.stringify(process.env.MONGO_URI));
@@ -64,22 +78,15 @@ const connectDB = async () => {
       serverSelectionTimeoutMS: 30000,
     });
     console.log('✅ MongoDB Connected successfully.');
-
-    // await Facility.syncIndexes();
-    // console.log("✅ Geo Index confirmed and synced.");
-
-    // startFacilitySyncCron();
-
+   
+       
     const PORT: number = Number(process.env.PORT) || 5000;
-    app.listen(PORT, '0.0.0.0', () =>
-      console.log(`🚀 Server running on port ${PORT}`)
-    );
+    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
   } catch (err) {
     console.error('❌ MongoDB connection error:', err);
     process.exit(1);
   }
 };
-
 
 
 connectDB();

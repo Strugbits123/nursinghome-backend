@@ -5,8 +5,14 @@ import * as googleService from "../services/googleService";
 import axios from "axios";
 import { PlaceDetails,
   findPlaceIdByText,  
-  getPlaceDetails, getCoordinatesByPlaceName } from "../services/googleService";
-import { summarizeReviews, SummarizeResult } from "../services/aiService";
+  getPlaceDetails, 
+  getCoordinatesByPlaceName,
+  batchProcessFacilities,
+  FacilityGoogleData,
+  BatchGoogleResult,
+  getApiUsageStats,
+  resetApiUsageStats } from "../services/googleService";
+import { summarizeReviews, summarizeReviewsBatch, SummarizeResult } from "../services/aiService";
 import Facility from "../models/NursingFacility"; 
 import { getCache, setCache } from "../config/redisClient";
 
@@ -14,7 +20,8 @@ import { getCache, setCache } from "../config/redisClient";
 
 // Get your API key from environment variables
 
-const CACHE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000; // 1 year for core details
+const REVIEWS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // refresh reviews weekly
 
 const CMS_API_URL =
   "https://data.cms.gov/provider-data/api/1/datastore/query/4pq5-n9py/0";
@@ -22,14 +29,13 @@ const CMS_API_URL =
 const SEARCH_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60; 
 const SEARCH_CACHE_KEY = (query: { lat?: string; lng?: string; q?: string }) => {
     if (query.lat && query.lng) {
-        // Key for coordinates search (normalize to fixed decimal places for consistency)
         const lat = parseFloat(query.lat).toFixed(4);
         const lng = parseFloat(query.lng).toFixed(4);
         return `search:nearby:${lat}_${lng}`;
     }
     if (query.q) {
-        // Key for text search (normalize query string)
-        return `search:query:${query.q.trim().toLowerCase().replace(/\s+/g, '_')}`;
+        const base = query.q.trim().toLowerCase().replace(/\s+/g, '_');
+        return `search:query:${base}`;
     }
     return 'search:invalid';
 };
@@ -118,25 +124,31 @@ const fetchAndCacheGoogleData = async (facility: any) => {
     if (redisData) {
       const parsed = JSON.parse(redisData);
 
-      // 🔄 Check if stale (older than 30 days)
+      // Core staleness (1 year)
       const lastUpdated = new Date(parsed.lastUpdated || 0);
-      const isStale = now.getTime() - lastUpdated.getTime() > CACHE_LIFETIME_MS;
+      const isCoreStale = now.getTime() - lastUpdated.getTime() > ONE_YEAR_MS;
 
-      if (isStale) {
+      // Reviews staleness (weekly)
+      const reviewsLastUpdated = new Date(parsed.reviewsLastUpdated || parsed.lastUpdated || 0);
+      const areReviewsStale = now.getTime() - reviewsLastUpdated.getTime() > REVIEWS_TTL_MS;
+
+      if (isCoreStale || areReviewsStale) {
         // 🔁 Refresh in background (non-blocking)
         refreshGoogleDataInBackground(facility, REDIS_KEY);
       }
 
-      // ✅ Return current cached data immediately
+      // ✅ Return current cached data immediately (limit photos to 4)
+      const photoUrls = (parsed.photoReferences || [])
+        .slice(0, 4)
+        .map((ref: string) => googleService.getPhotoUrl(ref));
+
       return {
         googleName: parsed.googleName,
         rating: parsed.rating,
         lat: parsed.lat,
         lng: parsed.lng,
-        photos: parsed.photoReferences.map((ref: string) =>
-          googleService.getPhotoUrl(ref)
-        ),
-        reviews: parsed.reviews,
+        photos: photoUrls,
+        reviews: parsed.reviews || [],
       };
     }
 
@@ -144,7 +156,9 @@ const fetchAndCacheGoogleData = async (facility: any) => {
     const mongoCache = facility.googleCache;
     if (mongoCache && mongoCache.lastUpdated) {
       const lastUpdated = new Date(mongoCache.lastUpdated);
-      const isStale = now.getTime() - lastUpdated.getTime() > CACHE_LIFETIME_MS;
+      const isCoreStale = now.getTime() - lastUpdated.getTime() > ONE_YEAR_MS;
+      const reviewsLastUpdated = new Date(mongoCache.reviewsLastUpdated || mongoCache.lastUpdated);
+      const areReviewsStale = now.getTime() - reviewsLastUpdated.getTime() > REVIEWS_TTL_MS;
 
       // Rebuild photo URLs
       const photoUrls = mongoCache.photoReferences.map((ref: string) =>
@@ -155,7 +169,7 @@ const fetchAndCacheGoogleData = async (facility: any) => {
       await setCache(REDIS_KEY, JSON.stringify(mongoCache));
 
       // If stale → background refresh
-      if (isStale) {
+      if (isCoreStale || areReviewsStale) {
         refreshGoogleDataInBackground(facility, REDIS_KEY);
       }
 
@@ -199,21 +213,26 @@ async function refreshGoogleDataInBackground(
   immediateReturn: boolean = false
 ) {
   try {
-    const placeIdResults = await Promise.allSettled([
-      googleService.findPlaceIdByText(facility.provider_name),
-      googleService.findPlaceIdByText(`${facility.provider_name} ${facility.zip_code}`),
-      googleService.findPlaceIdByText(`${facility.provider_name} ${facility.city_town}`),
+    // 🚀 Faster for single facility: avoid batch processor
+    const placeIdCandidates = await Promise.allSettled([
+      findPlaceIdByText(facility.provider_name),
+      findPlaceIdByText(`${facility.provider_name} ${facility.zip_code || ""}`.trim()),
+      findPlaceIdByText(`${facility.provider_name} ${facility.city_town || ""}`.trim()),
     ]);
 
-    const fulfilledResults = placeIdResults.filter(
-      (r): r is PromiseFulfilledResult<string | null> => r.status === "fulfilled"
+    const fulfilledCandidate = placeIdCandidates.find(
+      (r): r is PromiseFulfilledResult<string | null> => r.status === "fulfilled" && !!(r as PromiseFulfilledResult<string | null>).value
     );
+    const placeId = (fulfilledCandidate?.value ?? undefined) as string | undefined;
 
-    const placeId = fulfilledResults.find((r) => r.value)?.value;
-    if (!placeId) return null;
+    if (!placeId) {
+      return null;
+    }
 
-    const details = await googleService.getPlaceDetails(placeId);
-    if (!details) return null;
+    const details = await getPlaceDetails(placeId);
+    if (!details) {
+      return null;
+    }
 
     const photoReferences = details.photos
       ? details.photos.slice(0, 4).map((p: any) => p.photo_reference)
@@ -223,7 +242,9 @@ async function refreshGoogleDataInBackground(
       author_name: r.author_name,
       rating: r.rating,
       text: r.text,
-      time: r.time,
+      relative_time_description: r.relative_time_description,
+      profile_photo_url: r.profile_photo_url,
+      author_url: r.author_url,
     }));
 
     const now = new Date();
@@ -236,9 +257,9 @@ async function refreshGoogleDataInBackground(
       photoReferences,
       reviews,
       lastUpdated: now,
+      reviewsLastUpdated: now,
     };
 
-    // 🧠 Save to both Redis and Mongo
     await Promise.allSettled([
       setCache(REDIS_KEY, JSON.stringify(newCache)),
       Facility.updateOne(
@@ -266,133 +287,87 @@ async function refreshGoogleDataInBackground(
 }
 
 
+// ⚡ Fast, non-blocking Google data fetch: returns cached data immediately,
+// triggers background refresh when stale/missing.
+async function getGoogleDataFast(facility: any) {
+  const REDIS_KEY = `facility:${facility._id}:google`;
+  const now = new Date();
 
-// const fetchAndCacheGoogleData = async (facility: any) => {
-//   const now = new Date();
-//   const CACHE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-//   const REDIS_KEY = `facility:${facility._id}:google`;
+  try {
+    const redisData = await getCache(REDIS_KEY);
+    if (redisData) {
+      const parsed = JSON.parse(redisData);
+      // Background refresh if needed, but do not block
+      const lastUpdated = new Date(parsed.lastUpdated || 0);
+      const isCoreStale = now.getTime() - lastUpdated.getTime() > ONE_YEAR_MS;
+      const reviewsLastUpdated = new Date(parsed.reviewsLastUpdated || parsed.lastUpdated || 0);
+      const areReviewsStale = now.getTime() - reviewsLastUpdated.getTime() > REVIEWS_TTL_MS;
+      if (isCoreStale || areReviewsStale) {
+        // fire and forget
+        refreshGoogleDataInBackground(facility, REDIS_KEY);
+      }
 
-//   try {
-//     // 1️⃣ Try Redis first
-//     const redisData = await getCache(REDIS_KEY);
-//     if (redisData) {
-//       const parsed = JSON.parse(redisData);
-//       return {
-//         googleName: parsed.googleName,
-//         rating: parsed.rating,
-//         lat: parsed.lat,
-//         lng: parsed.lng,
-//         photos: parsed.photoReferences.map((ref: string) =>
-//           googleService.getPhotoUrl(ref)
-//         ),
-//         reviews: parsed.reviews,
-//       };
-//     }
+      const photoUrls = (parsed.photoReferences || [])
+        .slice(0, 4)
+        .map((ref: string) => googleService.getPhotoUrl(ref));
 
-//     // 2️⃣ Try MongoDB cache next
-//     const mongoCache = facility.googleCache;
-//     if (
-//       mongoCache &&
-//       mongoCache.lastUpdated &&
-//       now.getTime() - new Date(mongoCache.lastUpdated).getTime() <
-//         CACHE_LIFETIME_MS
-//     ) {
-//       const photoUrls = mongoCache.photoReferences.map((ref: string) =>
-//         googleService.getPhotoUrl(ref)
-//       );
+      return {
+        googleName: parsed.googleName ?? null,
+        rating: parsed.rating ?? null,
+        lat: parsed.lat ?? null,
+        lng: parsed.lng ?? null,
+        photos: photoUrls,
+        reviews: parsed.reviews || [],
+        hadCache: true,
+      };
+    }
 
-//       // Store in Redis for next time
-//       await setCache(
-//         REDIS_KEY,
-//         JSON.stringify(mongoCache),
-//         30 * 24 * 60 * 60 // 30 days
-//       );
+    const mongoCache = facility.googleCache;
+    if (mongoCache && mongoCache.lastUpdated) {
+      // store to Redis for next time (non-blocking)
+      setCache(REDIS_KEY, JSON.stringify(mongoCache)).catch(() => {});
 
-//       return {
-//         googleName: mongoCache.googleName,
-//         rating: mongoCache.rating,
-//         lat: mongoCache.lat,
-//         lng: mongoCache.lng,
-//         photos: photoUrls,
-//         reviews: mongoCache.reviews,
-//       };
-//     }
+      const photoUrls = (mongoCache.photoReferences || []).slice(0, 4).map((ref: string) => googleService.getPhotoUrl(ref));
+      // background refresh if stale
+      const lastUpdated = new Date(mongoCache.lastUpdated);
+      const isCoreStale = now.getTime() - lastUpdated.getTime() > ONE_YEAR_MS;
+      const reviewsLastUpdated = new Date(mongoCache.reviewsLastUpdated || mongoCache.lastUpdated);
+      const areReviewsStale = now.getTime() - reviewsLastUpdated.getTime() > REVIEWS_TTL_MS;
+      if (isCoreStale || areReviewsStale) {
+        refreshGoogleDataInBackground(facility, REDIS_KEY);
+      }
 
-//     // 3️⃣ Cache missing or stale — fetch from Google
-//     const placeIdResults = await Promise.allSettled([
-//       googleService.findPlaceIdByText(facility.provider_name),
-//       googleService.findPlaceIdByText(
-//         `${facility.provider_name} ${facility.zip_code}`
-//       ),
-//       googleService.findPlaceIdByText(
-//         `${facility.provider_name} ${facility.city_town}`
-//       ),
-//     ]);
+      return {
+        googleName: mongoCache.googleName ?? null,
+        rating: mongoCache.rating ?? null,
+        lat: mongoCache.lat ?? null,
+        lng: mongoCache.lng ?? null,
+        photos: photoUrls,
+        reviews: mongoCache.reviews || [],
+        hadCache: true,
+      };
+    }
+  } catch (e) {
+    // ignore and fallback to background
+  }
 
-//     const placeId = placeIdResults.find(
-//       (r) => r.status === "fulfilled" && r.value
-//     )?.value;
+  // Trigger background refresh immediately for first-time users
+  refreshGoogleDataInBackground(facility, REDIS_KEY);
 
-//     if (placeId) {
-//       const details = await googleService.getPlaceDetails(placeId);
-//       if (details) {
-//         const photoReferences = details.photos
-//           ? details.photos.slice(0, 4).map((p: any) => p.photo_reference)
-//           : [];
-//         const reviews = (details.reviews || []).slice(0, 10).map((r: any) => ({
-//           author_name: r.author_name,
-//           rating: r.rating,
-//           text: r.text,
-//           time: r.time,
-//         }));
+  // Quick placeholder response
+  return {
+    googleName: null,
+    rating: null,
+    lat: null,
+    lng: null,
+    photos: [],
+    reviews: [],
+    hadCache: false,
+  };
+}
 
-//         const newCache = {
-//           placeId,
-//           googleName: details.name,
-//           rating: details.rating,
-//           lat: details.lat,
-//           lng: details.lng,
-//           photoReferences,
-//           reviews,
-//           lastUpdated: now,
-//         };
 
-//         // 4️⃣ Save to Redis and MongoDB in background
-//         await Promise.allSettled([
-//           setCache(REDIS_KEY, JSON.stringify(newCache)),
-//           Facility.updateOne(
-//             { _id: facility._id },
-//             { $set: { googleCache: newCache } },
-//             { upsert: true }
-//           ),
-//         ]);
 
-//         return {
-//           googleName: newCache.googleName,
-//           rating: newCache.rating,
-//           lat: newCache.lat,
-//           lng: newCache.lng,
-//           photos: photoReferences.map((ref) =>
-//             googleService.getPhotoUrl(ref)
-//           ),
-//           reviews,
-//         };
-//       }
-//     }
-//   } catch (err) {
-//     console.error(`Google fetch failed for ${facility.provider_name}:`, err);
-//   }
-
-//   // 5️⃣ Fallback response
-//   return {
-//     googleName: null,
-//     rating: null,
-//     lat: null,
-//     lng: null,
-//     photos: [],
-//     reviews: [],
-//   };
-// };
 
 
 // Get Facility Details
@@ -411,18 +386,53 @@ export const getFacilityDetails = async (
 
     const safeName = name.trim();
     const firstWord = safeName.split(/\s+/)[0];
-    const escapedPrefix = firstWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const searchPrefix = escapedPrefix;
+    const escapedFirstWord = firstWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedFull = safeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-    const facility = await Facility.findOne({
-      provider_name: { $regex: `^${searchPrefix}`, $options: "i" },
+    // Try anchored match on both full name and first word
+    let facility = await Facility.findOne({
+      $or: [
+        { provider_name: { $regex: `^${escapedFull}`, $options: "i" } },
+        { legal_business_name: { $regex: `^${escapedFull}`, $options: "i" } },
+        { provider_name: { $regex: `^${escapedFirstWord}`, $options: "i" } },
+        { legal_business_name: { $regex: `^${escapedFirstWord}`, $options: "i" } },
+      ],
     })
       .sort({ provider_name: 1 })
       .lean();
 
     if (!facility) {
-      console.log(`[DETAIL DEBUG] No facilities found with prefix: ${searchPrefix}`);
-      return res.status(404).json({ message: "Facility not found." });
+      // Fallback 1: Trimmed field match using $expr to handle stray spaces
+      const exprRegex = new RegExp(`^${escapedFirstWord}`, "i");
+      const trimmed = await Facility.findOne({
+        $or: [
+          { $expr: { $regexMatch: { input: { $trim: { input: "$provider_name" } }, regex: exprRegex } } },
+          { $expr: { $regexMatch: { input: { $trim: { input: "$legal_business_name" } }, regex: exprRegex } } },
+        ],
+      })
+        .sort({ provider_name: 1 })
+        .lean();
+
+      if (trimmed) {
+        facility = trimmed;
+      } else {
+        // Fallback 2: contains search to help catch slight variations
+        const fallback = await Facility.findOne({
+          $or: [
+            { provider_name: { $regex: `${escapedFirstWord}`, $options: "i" } },
+            { legal_business_name: { $regex: `${escapedFirstWord}`, $options: "i" } },
+          ],
+        })
+          .sort({ provider_name: 1 })
+          .lean();
+
+        if (!fallback) {
+          console.log(`[DETAIL DEBUG] No facilities found for name='${safeName}' (full/first-word, anchored; trimmed; contains).`);
+          return res.status(404).json({ message: "Facility not found." });
+        }
+
+        facility = fallback;
+      }
     }
 
     // ✅ Fetch Google data safely
@@ -471,10 +481,12 @@ export const getFacilityDetails = async (
 
 
 
+
+
 // ✅ Map of states (Full Name → Abbreviation)
 const stateToAbbr: Record<string, string> = {
   "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
-  "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE", "Florida": "FL", "Georgia": "GA",
+  "Colorado": "CO", "Connecticut": "CT", "Delware": "DE", "Florida": "FL", "Georgia": "GA",
   "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
   "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
   "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
@@ -487,320 +499,1064 @@ const stateToAbbr: Record<string, string> = {
 };
 
 // ✅ Detects query type and normalizes state names
+// function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
+//   const zipRegex = /^\d{5}$/; // 5-digit ZIP Code (like "07001")
+//   if (zipRegex.test(q)) return { type: "zip", value: q };
+
+//   // Check if full state name → convert to abbreviation
+//   const stateMatch = Object.keys(stateToAbbr).find(
+//     state => state.toLowerCase() === q.toLowerCase()
+//   );
+//   if (stateMatch) return { type: "state", value: stateToAbbr[stateMatch] };
+
+//   // Otherwise, treat as city
+//   return { type: "city", value: q };
+// }
+
 function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
-  const zipRegex = /^\d{5}$/; // 5-digit ZIP Code (like "07001")
-  if (zipRegex.test(q)) return { type: "zip", value: q };
+  const cleanQ = q.trim().toLowerCase();
+  const zipRegex = /^\d{5}$/;
+  if (zipRegex.test(cleanQ)) {
+    console.log("🔍 Query detected as ZIP:", cleanQ);
+    return { type: "zip", value: cleanQ };
+  }
 
-  // Check if full state name → convert to abbreviation
-  const stateMatch = Object.keys(stateToAbbr).find(
-    state => state.toLowerCase() === q.toLowerCase()
+  // Check full state name exact or starts with partial
+  const stateMatch = Object.keys(stateToAbbr).find(state =>
+    state.toLowerCase() === cleanQ || state.toLowerCase().startsWith(cleanQ)
   );
-  if (stateMatch) return { type: "state", value: stateToAbbr[stateMatch] };
 
-  // Otherwise, treat as city
+  if (stateMatch) {
+    console.log(`🔍 Query detected as STATE: "${q}" → Abbreviation: "${stateToAbbr[stateMatch]}"`);
+    return { type: "state", value: stateToAbbr[stateMatch] };
+  }
+
+  console.log("🔍 Query detected as CITY:", q);
   return { type: "city", value: q };
 }
-// ✅ Controller
+
+
+
+
+// New Code
+
+// export const searchFacilitiesWithReviews = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction
+// ) => {
+//   try {
+//     const { lat, lng, q, page = "1", limit = "8" } = req.query as {
+//       lat?: string;
+//       lng?: string;
+//       q?: string;
+//       page?: string;
+//       limit?: string;
+//     };
+
+//     const pageNum = parseInt(page);
+//     const limitNum = parseInt(limit);
+
+//     // -----------------------------
+//     // Base and page cache keys
+//     // -----------------------------
+//     const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
+//     const pageCacheKey = `${baseCacheKey}&page${pageNum}`;
+
+//     // Check page-level cache first
+//     const cachedPage = await getCache(pageCacheKey);
+//     if (cachedPage) {
+//       console.log(`✅ CACHE HIT for ${pageCacheKey}`);
+//       return res.status(200).json({ ...JSON.parse(cachedPage), cached: true, from: "page-cache" });
+//     }
+
+//     // -----------------------------
+//     // Load facilities from DB
+//     // -----------------------------
+//     let facilities: any[] = [];
+//     if (lat && lng) {
+//       const latitude = parseFloat(lat);
+//       const longitude = parseFloat(lng);
+//       facilities = await Facility.find({
+//         geoLocation: {
+//           $near: {
+//             $geometry: { type: "Point", coordinates: [longitude, latitude] },
+//             $maxDistance: 50000,
+//           },
+//         },
+//       }).lean();
+//     } else if (q) {
+//       const { type, value } = normalizeQuery(q.trim());
+//       const mongoQuery: any = {};
+//       if (type === "zip") mongoQuery.zip_code = value;
+//       else if (type === "state") mongoQuery.state = new RegExp(`^${value}$`, "i");
+//       else mongoQuery.city_town = new RegExp(value, "i");
+//       facilities = await Facility.find(mongoQuery).lean();
+//     }
+
+//     const totalFacilities = facilities.length;
+//     if (totalFacilities === 0) return res.status(200).json({ data: [], total: 0 });
+
+//     // -----------------------------
+//     // Pagination slice
+//     // -----------------------------
+//     const start = (pageNum - 1) * limitNum;
+//     const end = pageNum * limitNum;
+//     const pagedFacilities = facilities.slice(start, end);
+
+//     // -----------------------------
+//     // Google + AI enrichment logic
+//     // -----------------------------
+//     let pagedResults: any[] = [];
+
+//     // **Pages 1–6:** Preload Google+AI in background for first 48 items
+//     if (pageNum <= 6) {
+//       pagedResults = pagedFacilities.map(f => ({
+//         ...f,
+//         googleName: null,
+//         rating: null,
+//         photo: null,
+//         lat: null,
+//         lng: null,
+//         aiSummary: { summary: "", pros: [], cons: [] },
+//       }));
+
+//       // Cache each page
+//       await setCache(pageCacheKey, JSON.stringify({ data: pagedResults, total: totalFacilities }), ONE_YEAR_MS);
+
+//       // Background fetch for Google+AI (async)
+//       (async () => {
+//         try {
+//           const first48 = facilities.slice(0, 48);
+//           const googleResults = await Promise.all(first48.map(f => getGoogleDataFast(f)));
+//           const reviewsTexts = first48.map((_, i) =>
+//             googleResults[i]?.reviews?.length 
+//             ? googleResults[i].reviews.map((r: { text: string }) => r.text).join("\n") 
+//             : ""
+//           );
+//           const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+//           for (let p = 1; p <= 6; p++) {
+//             const pageStart = (p - 1) * limitNum;
+//             const pageEnd = pageStart + limitNum;
+//             const pageData = first48.slice(pageStart, pageEnd).map((f, i) => {
+//               const gd = googleResults[pageStart + i] ?? {};
+//               return {
+//                 ...f,
+//                 googleName: gd.googleName ?? null,
+//                 rating: gd.rating ?? null,
+//                 photo: gd.photos?.[0] || null,
+//                 lat: gd.lat ?? null,
+//                 lng: gd.lng ?? null,
+//                 aiSummary: aiSummaries[pageStart + i] || { summary: "", pros: [], cons: [] },
+//               };
+//             });
+//             const key = `${baseCacheKey}&page${p}`;
+//             await setCache(key, JSON.stringify({ data: pageData, total: totalFacilities }), ONE_YEAR_MS);
+//             console.log(`💾 Cached Google+AI for page ${p}`);
+//           }
+//         } catch (err) {
+//           console.error("❌ Background enrichment error:", err);
+//         }
+//       })();
+
+//     } else {
+//       // **Pages 7+:** Fetch Google+AI only for this page
+//       const googleResults = await Promise.all(pagedFacilities.map(f => getGoogleDataFast(f)));
+//       const reviewsTexts = pagedFacilities.map((_, i) =>
+//        googleResults[i]?.reviews?.length 
+//         ? googleResults[i].reviews.map((r: { text: string }) => r.text).join("\n") 
+//         : ""
+//       );
+      
+//       const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+//       pagedResults = pagedFacilities.map((f, i) => {
+//         const gd = googleResults[i] ?? {};
+//         return {
+//           ...f,
+//           googleName: gd.googleName ?? null,
+//           rating: gd.rating ?? null,
+//           photo: gd.photos?.[0] || null,
+//           lat: gd.lat ?? null,
+//           lng: gd.lng ?? null,
+//           aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+//         };
+//       });
+
+//       await setCache(pageCacheKey, JSON.stringify({ data: pagedResults, total: totalFacilities }), ONE_YEAR_MS);
+//       console.log(`💾 Cached Google+AI for page ${pageNum}`);
+//     }
+
+//     // -----------------------------
+//     // Return paged results
+//     // -----------------------------
+//     return res.status(200).json({
+//       data: pagedResults,
+//       total: totalFacilities,
+//       page: pageNum,
+//       limit: limitNum,
+//       cached: false,
+//       from: pageNum <= 6 ? "db" : "db+google+ai",
+//     });
+
+//   } catch (err: any) {
+//     console.error("❌ API error:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// };
+
+
+type FacilityType = any; 
+
+
 export const searchFacilitiesWithReviews = async (
   req: Request,
   res: Response,
   next: NextFunction
 ) => {
   try {
-    const { lat, lng, q } = req.query as { lat?: string; lng?: string; q?: string };
-    const cacheKey = SEARCH_CACHE_KEY(req.query as { lat?: string; lng?: string; q?: string });
+    const { q, page = "1", limit = "8" } = req.query as {
+      q?: string;
+      page?: string;
+      limit?: string;
+    };
 
-    // --- 1. REDIS CACHE CHECK ---
-    if (cacheKey !== 'search:invalid') {
-      const cachedResult = await getCache(cacheKey);
-      if (cachedResult) {
-        console.log(`✅ CACHE HIT for search key: ${cacheKey}`);
-        return res.status(200).json(JSON.parse(cachedResult));
-      }
-      console.log(`❌ CACHE MISS for search key: ${cacheKey}`);
-    }
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
 
-    // ✅ Case 1: Search by coordinates (nearby)
-    if (lat && lng) {
-      const latitude = parseFloat(lat);
-      const longitude = parseFloat(lng);
+    if (!q) return res.status(400).json({ message: "Missing search query" });
 
-      if (isNaN(latitude) || isNaN(longitude)) {
-        return res.status(400).json({ message: "Invalid coordinates" });
-      }
+    const redisKey = `search:query:${q.toLowerCase()}`;
 
-      console.log("📍 Searching nearby facilities:", latitude, longitude);
+    // -----------------------------
+    // 1️⃣ Get all data from cache
+    // -----------------------------
+    const raw = await getCache(redisKey);
+    if (!raw) return res.status(200).json({ data: [], total: 0 });
 
-      const nearbyFacilities = await Facility.find({
-        geoLocation: {
-          $near: {
-            $geometry: { type: "Point", coordinates: [longitude, latitude] },
-            $maxDistance: 50000, // 50km radius
-          },
-        },
-      }).limit(50);
+    const allData = JSON.parse(raw);
+    const total = allData.length;
 
-      if (nearbyFacilities.length > 0) {
-        await setCache(cacheKey, JSON.stringify(nearbyFacilities), SEARCH_CACHE_TTL_SECONDS);
-      }
+    // -----------------------------
+    // 2️⃣ Paginate
+    // -----------------------------
+    const startIdx = (pageNum - 1) * limitNum;
+    const endIdx = pageNum * limitNum;
+    const pagedData = allData.slice(startIdx, endIdx);
 
-      return res.status(200).json(nearbyFacilities);
-    }
-
-    if (!q) {
-      return res.status(400).json({ message: "Missing search query" });
-    }
-
-    const safeQuery = q.trim();
-    const { type, value } = normalizeQuery(safeQuery);
-    console.log("🔍 Detected:", type, "| Normalized Value:", value);
-
-    const mongoQuery: any = {};
-    if (type === "zip") {
-      mongoQuery.zip_code = value;
-    } else if (type === "state") {
-      mongoQuery.state = new RegExp(`^${value}$`, "i");
-    } else {
-      mongoQuery.city_town = new RegExp(value, "i");
-    }
-
-    // Fetch facilities from MongoDB
-    const facilities = await Facility.find(mongoQuery).lean();
-
-    if (!facilities || facilities.length === 0) {
-      return res.status(200).json([]);
-    }
-
-    // ✅ Fetch Google data in parallel
+    // -----------------------------
+    // 3️⃣ Google + AI enrichment
+    // -----------------------------
     const googleResults = await Promise.all(
-      facilities.map((facility) => fetchAndCacheGoogleData(facility))
+      pagedData.map((f: FacilityType) => getGoogleDataFast(f))
     );
 
-    // ✅ Process AI summaries safely
-    const finalResults = await Promise.all(
-      facilities.map(async (facility, index) => {
-        const googleData = googleResults[index] ?? {
-          googleName: null,
-          rating: null,
-          lat: null,
-          lng: null,
-          photos: [],
-          reviews: [],
-        };
-
-        let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] };
-
-        const reviewsText = googleData.reviews?.length
-          ? googleData.reviews.map((r: any) => r.text).join("\n")
-          : "";
-
-        if (reviewsText) {
-          try {
-            aiSummary = await summarizeReviews(reviewsText);
-          } catch (err) {
-            console.error("⚠️ AI Summary failed for facility:", facility.provider_name, err);
-          }
-        }
-
-        return {
-          ...facility,
-          googleName: googleData.googleName ?? null,
-          rating: googleData.rating ?? null,
-          photo: googleData.photos?.[0] || null,
-          lat: googleData.lat ?? null,
-          lng: googleData.lng ?? null,
-          aiSummary,
-        };
-      })
+    const reviewsTexts = pagedData.map((_: FacilityType, i: number) =>
+      googleResults[i]?.reviews?.length
+        ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+        : ""
     );
 
-    // --- 3. CACHE SET FOR TEXT SEARCH (30 DAYS) ---
-    if (finalResults.length > 0) {
-      await setCache(cacheKey, JSON.stringify(finalResults), SEARCH_CACHE_TTL_SECONDS);
-    }
+    const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
 
-    res.status(200).json(finalResults);
-  } catch (err) {
-    console.error("❌ Error in searchFacilitiesWithReviews:", err);
-    next(err);
+    const pagedResults = pagedData.map((f: FacilityType, i: number) => {
+      const gd = googleResults[i] ?? {};
+      return {
+        ...f,
+        googleName: gd.googleName ?? null,
+        rating: gd.rating ?? null,
+        photo: gd.photos?.[0] || null,
+        lat: gd.lat ?? null,
+        lng: gd.lng ?? null,
+        aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+      };
+    });
+
+    // -----------------------------
+    // 4️⃣ Cache current page
+    // -----------------------------
+    const pageCacheKey = `facility:query:${q.toLowerCase()}&page${pageNum}`;
+    await setCache(pageCacheKey, JSON.stringify({ data: pagedResults, total }), ONE_YEAR_MS);
+
+    // -----------------------------
+    // 5️⃣ Return current page
+    // -----------------------------
+    return res.status(200).json({
+      data: pagedResults,
+      total,
+      page: pageNum,
+      limit: limitNum,
+      cached: true,
+      from: "cache-only",
+    });
+
+  } catch (err: any) {
+    console.error("❌ API error:", err);
+    res.status(500).json({ error: err.message });
   }
 };
 
 
-// export const filterFacilitiesWithReviews = async (
+
+
+// Lasssssssssst Code 
+// export const searchFacilitiesWithReviews = async (
 //   req: Request,
 //   res: Response,
 //   next: NextFunction
 // ) => {
 //   try {
-//     const {
-//       city,
-//       state,
-//       zip,
-//       bedsMin,
-//       bedsMax,
-//       ownership,
-//       distanceKm,
-//       userLat,
-//       userLng,
-//       locationName,
-//       fromLocation,
-//       toLocation,
-//       ratingMin,
-//     } = req.query as any;
+//     const { q, page = "1", limit = "8" } = req.query as {
+//       q?: string;
+//       page?: string;
+//       limit?: string;
+//     };
 
-//     const limit = 20;
-//     const pipeline: any[] = [];
-//     const matchQuery: any = {};
-//     let finalLat: number | null = null;
-//     let finalLng: number | null = null;
-//     let finalDistanceKm: number | null = null;
-//     let fromToDistanceKm: number | null = null;
-//     let isGeoSearch = false;
+//     const pageNum = parseInt(page);
+//     const limitNum = parseInt(limit);
 
-//     // 🗺️ 1️⃣ FROM → TO SEARCH
-//     if (fromLocation && toLocation) {
-//       isGeoSearch = true;
-//       console.log("🚀 Performing FROM-TO search...");
+//     if (!q) return res.status(400).json({ message: "Missing search query" });
 
-//       const fromCoords = await googleService.getCoordinatesByPlaceName(fromLocation);
-//       const toCoords = await googleService.getCoordinatesByPlaceName(toLocation);
+//     const pageCacheKey = `facility:query:${q.toLowerCase()}&page:${pageNum}`;
 
-//       // Haversine formula
-//       const R = 6371;
-//       const dLat = ((toCoords.lat - fromCoords.lat) * Math.PI) / 180;
-//       const dLon = ((toCoords.lng - fromCoords.lng) * Math.PI) / 180;
-//       const a =
-//         Math.sin(dLat / 2) ** 2 +
-//         Math.cos(fromCoords.lat * Math.PI / 180) *
-//           Math.cos(toCoords.lat * Math.PI / 180) *
-//           Math.sin(dLon / 2) ** 2;
-//       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-//       fromToDistanceKm = R * c;
-
-//       finalLat = (fromCoords.lat + toCoords.lat) / 2;
-//       finalLng = (fromCoords.lng + toCoords.lng) / 2;
-//       finalDistanceKm = fromToDistanceKm / 2 + 50;
-//     }
-
-//     // 📍 2️⃣ USER LOCATION SEARCH
-//     else if (userLat && userLng) {
-//       isGeoSearch = true;
-//       finalLat = parseFloat(userLat);
-//       finalLng = parseFloat(userLng);
-//       finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
-//     }
-
-//     // 🧭 3️⃣ LOCATION NAME SEARCH
-//     else if (locationName) {
-//       isGeoSearch = true;
-//       const coords = await googleService.getCoordinatesByPlaceName(locationName);
-//       finalLat = coords.lat;
-//       finalLng = coords.lng;
-//       finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
-//     }
-
-//     // 🏙️ 4️⃣ CITY / STATE / ZIP FILTERS
-//     if (city) matchQuery.city_town = new RegExp(city, "i");
-//     if (state) matchQuery.state = state.toUpperCase();
-//     if (zip) matchQuery.zip_code = zip;
-
-//     // 🏠 5️⃣ OWNERSHIP TYPE
-//     if (ownership) {
-//       const ownershipArray = ownership.split(",").map((o: string) => o.trim());
-//       matchQuery.ownership_type = { $in: ownershipArray };
-//     }
-
-//     // 🛏️ 6️⃣ BEDS RANGE FILTER
-//     if (bedsMin || bedsMax) {
-//       matchQuery.number_of_certified_beds = {};
-//       if (bedsMin) matchQuery.number_of_certified_beds.$gte = parseInt(bedsMin);
-//       if (bedsMax) matchQuery.number_of_certified_beds.$lte = parseInt(bedsMax);
-//     }
-
-//     // 🌎 7️⃣ GEO FILTER (optional)
-//     if (isGeoSearch && finalLat && finalLng) {
-//       pipeline.push({
-//         $geoNear: {
-//           near: { type: "Point", coordinates: [finalLng, finalLat] },
-//           distanceField: "distance_m",
-//           key: "geoLocation",
-//           maxDistance: (finalDistanceKm || 20) * 1000, // meters
-//           spherical: true,
-//           query: matchQuery,
-//         },
-//       });
-//     } else {
-//       pipeline.push({ $match: matchQuery });
-//     }
-
-//     // ⭐ 8️⃣ RATING FILTER
-//     const ratingMinNum = ratingMin ? parseInt(ratingMin) : null;
-//     if (ratingMinNum && ratingMinNum >= 1 && ratingMinNum <= 5) {
-//       pipeline.push({
-//         $addFields: {
-//           numeric_overall_rating: {
-//             $cond: {
-//               if: {
-//                 $and: [
-//                   { $ifNull: ["$overall_rating", false] },
-//                   { $ne: ["$overall_rating", ""] },
-//                 ],
-//               },
-//               then: { $toDouble: "$overall_rating" },
-//               else: 0,
-//             },
-//           },
-//         },
-//       });
-
-//       pipeline.push({
-//         $match: { numeric_overall_rating: { $gte: ratingMinNum } },
+//     // -----------------------------
+//     // 0️⃣ Check if page is cached
+//     // -----------------------------
+//     const cachedPage = await getCache(pageCacheKey);
+//     if (cachedPage) {
+//       const parsed = JSON.parse(cachedPage);
+//       return res.status(200).json({
+//         ...parsed,
+//         cached: true,
+//         from: "cache",
 //       });
 //     }
 
-//     // 🔢 LIMIT
-//     pipeline.push({ $limit: limit });
+//     // -----------------------------
+//     // 1️⃣ Get data directly from DB (only current page)
+//     // -----------------------------
+//     const skip = (pageNum - 1) * limitNum;
 
-//     // 🚀 EXECUTE
-//     const facilities = await Facility.aggregate(pipeline);
-//     console.log(`✅ Found ${facilities.length} facilities`);
+//     const facilities = await Facility.find({
+//       name: { $regex: q, $options: "i" },
+//     })
+//       .skip(skip)
+//       .limit(limitNum)
+//       .lean();
 
-//     // 🧠 GOOGLE PLACE DATA
+//     const total = await Facility.countDocuments({
+//       name: { $regex: q, $options: "i" },
+//     });
+
+//     // -----------------------------
+//     // 2️⃣ Google + AI enrichment
+//     // -----------------------------
 //     const googleResults = await Promise.all(
-//       facilities.map((f: any) => fetchAndCacheGoogleData(f))
+//       facilities.map((f: FacilityType) => getGoogleDataFast(f))
 //     );
 
-//     const finalResults = facilities.map((f: any, i: number) => {
-//       const g = googleResults[i];
+//     const reviewsTexts = facilities.map((_: FacilityType, i: number) =>
+//       googleResults[i]?.reviews?.length
+//         ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+//         : ""
+//     );
+
+//     const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+//     const pagedResults = facilities.map((f: FacilityType, i: number) => {
+//       const gd = googleResults[i] ?? {};
 //       return {
 //         ...f,
-//         distance_km: f.distance_m ? f.distance_m / 1000 : null,
-//         googleName: g?.googleName,
-//         rating: g?.rating,
-//         photo: g?.photos?.[0] || null,
-//         lat: g?.lat || f.latitude,
-//         lng: g?.lng || f.longitude,
-//         aiSummary: { summary: "", pros: [], cons: [] },
+//         googleName: gd.googleName ?? null,
+//         rating: gd.rating ?? null,
+//         photo: gd.photos?.[0] || null,
+//         lat: gd.lat ?? null,
+//         lng: gd.lng ?? null,
+//         aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
 //       };
 //     });
 
-//     // 📦 RESPONSE
-//     const response: any = { facilities: finalResults };
-//     if (fromLocation && toLocation) {
-//       response.fromLocation = fromLocation;
-//       response.toLocation = toLocation;
-//       response.fromToDistanceKm = fromToDistanceKm;
-//     } else if (isGeoSearch && finalLat && finalLng) {
-//       response.centerCoords = { lat: finalLat, lng: finalLng };
+//     // -----------------------------
+//     // 3️⃣ Cache this page for 1 year
+//     // -----------------------------
+//     await setCache(
+//       pageCacheKey,
+//       JSON.stringify({ data: pagedResults, total, page: pageNum, limit: limitNum }),
+//       ONE_YEAR_MS
+//     );
+
+//     // -----------------------------
+//     // 4️⃣ Return results
+//     // -----------------------------
+//     return res.status(200).json({
+//       data: pagedResults,
+//       total,
+//       page: pageNum,
+//       limit: limitNum,
+//       cached: false,
+//       from: "db",
+//     });
+//   } catch (err: any) {
+//     console.error("❌ API error:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// // -----------------------------
+// // Search Controller
+// // -----------------------------
+// export const searchFacilitiesWithReviews = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction
+// ) => {
+//   try {
+//     const { lat, lng, q, page = "1", limit = "8" } = req.query as {
+//       lat?: string;
+//       lng?: string;
+//       q?: string;
+//       page?: string;
+//       limit?: string;
+//     };
+
+//     const pageNum = parseInt(page);
+//     const limitNum = parseInt(limit);
+
+//     if (!q && !(lat && lng))
+//       return res.status(400).json({ message: "Missing search query" });
+
+//     // -----------------------------
+//     // PAGE CACHE KEY
+//     // -----------------------------
+//     const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
+//     const pageCacheKey = `${baseCacheKey}&page${pageNum}`;
+
+//     // -----------------------------
+//     // 1️⃣ Return from page-level cache if exists
+//     // -----------------------------
+//     const cachedPage = await getCache(pageCacheKey);
+//     if (cachedPage) {
+//       return res.status(200).json({ ...JSON.parse(cachedPage), cached: true, from: "page-cache" });
 //     }
 
-//     res.json(response);
+//     // -----------------------------
+//     // 2️⃣ Load facilities from MongoDB
+//     // -----------------------------
+//     let facilities: any[] = [];
+
+//     if (lat && lng) {
+//       const latitude = parseFloat(lat);
+//       const longitude = parseFloat(lng);
+//       facilities = await Facility.find({
+//         geoLocation: {
+//           $near: {
+//             $geometry: { type: "Point", coordinates: [longitude, latitude] },
+//             $maxDistance: 50000,
+//           },
+//         },
+//       }).lean();
+//     } else if (q) {
+//       const { type, value } = normalizeQuery(q.trim());
+//       console.log("🔹 Detected type:", type, "| Normalized value:", value);
+
+//       const mongoQuery: any = {};
+//       if (type === "zip") mongoQuery.zip_code = value;
+//       else if (type === "state") mongoQuery.state = new RegExp(value, "i");
+//       else mongoQuery.city_town = new RegExp(value, "i");
+
+//       facilities = await Facility.find(mongoQuery).lean();
+//     }
+
+//     const total = facilities.length;
+//     if (!total) return res.status(200).json({ data: [], total });
+
+//     // -----------------------------
+//     // 3️⃣ Determine slice for current page
+//     // -----------------------------
+//     const startIdx = (pageNum - 1) * limitNum;
+//     const endIdx = pageNum * limitNum;
+//     const pagedFacilities = facilities.slice(startIdx, endIdx);
+
+//     // -----------------------------
+//     // 4️⃣ Google + AI enrichment for current page
+//     // -----------------------------
+//     const googleResults = await Promise.all(
+//       pagedFacilities.map(f => getGoogleDataFast(f))
+//     );
+
+//     const reviewsTexts = pagedFacilities.map((_, i) =>
+//       googleResults[i]?.reviews?.length
+//         ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+//         : ""
+//     );
+
+//     const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+//     const pagedResults = pagedFacilities.map((f, i) => {
+//       const gd = googleResults[i] ?? {};
+//       return {
+//         ...f,
+//         googleName: gd.googleName ?? null,
+//         rating: gd.rating ?? null,
+//         photo: gd.photos?.[0] || null,
+//         lat: gd.lat ?? null,
+//         lng: gd.lng ?? null,
+//         aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+//       };
+//     });
+
+//     // -----------------------------
+//     // 5️⃣ Cache current page
+//     // -----------------------------
+//     await setCache(
+//       pageCacheKey,
+//       JSON.stringify({ data: pagedResults, total }),
+//       ONE_YEAR_MS
+//     );
+
+//     // -----------------------------
+//     // 6️⃣ Progressive caching: fetch remaining pages in background
+//     // -----------------------------
+//     (async () => {
+//       try {
+//         const totalPages = Math.ceil(total / limitNum);
+//         for (let p = 1; p <= totalPages; p++) {
+//           const pageKey = `${baseCacheKey}&page${p}`;
+//           const cached = await getCache(pageKey);
+//           if (cached) continue;
+
+//           const s = (p - 1) * limitNum;
+//           const e = p * limitNum;
+//           const pageSlice = facilities.slice(s, e);
+
+//           if (!pageSlice.length) continue;
+
+//           const googleAll = await Promise.all(pageSlice.map(f => getGoogleDataFast(f)));
+//           const allReviews = pageSlice.map((_, i) =>
+//             googleAll[i]?.reviews?.length
+//               ? googleAll[i].reviews.map((r: any) => r.text).join("\n")
+//               : ""
+//           );
+//           const allSummaries = await summarizeReviewsBatch(allReviews);
+
+//           const enriched = pageSlice.map((f, i) => {
+//             const gd = googleAll[i] ?? {};
+//             return {
+//               ...f,
+//               googleName: gd.googleName ?? null,
+//               rating: gd.rating ?? null,
+//               photo: gd.photos?.[0] || null,
+//               lat: gd.lat ?? null,
+//               lng: gd.lng ?? null,
+//               aiSummary: allSummaries[i] || { summary: "", pros: [], cons: [] },
+//             };
+//           });
+
+//           await setCache(pageKey, JSON.stringify({ data: enriched, total }), ONE_YEAR_MS);
+//         }
+//       } catch (err) {
+//         console.error("❌ Progressive caching error:", err);
+//       }
+//     })();
+
+//     // -----------------------------
+//     // 7️⃣ Return current page
+//     // -----------------------------
+//     return res.status(200).json({
+//       data: pagedResults,
+//       total,
+//       page: pageNum,
+//       limit: limitNum,
+//       cached: false,
+//       from: "db",
+//     });
+
+//   } catch (err: any) {
+//     console.error("❌ API error:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// };
+
+
+
+
+
+
+
+
+
+
+
+
+// Cached Data New Code
+// export const searchFacilitiesWithReviews = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction
+// ) => {
+//   try {
+//     const { lat, lng, q, page = "1", limit = "8" } = req.query as {
+//       lat?: string;
+//       lng?: string;
+//       q?: string;
+//       page?: string;
+//       limit?: string;
+//     };
+
+//     const pageNum = parseInt(page);
+//     const limitNum = parseInt(limit);
+// // Only preload for first page request
+//     if (q && pageNum === 1) {
+//       const redisKey = `search:query:${q.toLowerCase()}`;
+//       const raw = await getCache(redisKey);
+//       if (raw) {
+//         const cachedArray = JSON.parse(raw);
+//         const total = cachedArray.length;
+
+//         // Take first 6 pages
+//         const endIdx = Math.min(limitNum * 6, total);
+//         const firstSixPagesData = cachedArray.slice(0, endIdx);
+
+//         // Cache each page individually
+//         for (let p = 1; p <= 6; p++) {
+//           const start = (p - 1) * limitNum;
+//           const end = p * limitNum;
+//           const pageData = cachedArray.slice(start, end);
+//           const pageCacheKey = `facility:query:${q.toLowerCase()}&page${p}`;
+//           await setCache(pageCacheKey, JSON.stringify({ data: pageData, total }), ONE_YEAR_MS);
+//         }
+
+//         return res.status(200).json({
+//           data: firstSixPagesData,
+//           total,
+//           page: 1,
+//           limit: limitNum,
+//           cached: true,
+//           pagesShown: 6, // indicate first 6 pages are sent
+//           from: "redis-top",
+//         });
+//       }
+//     }
+    
+
+//     // -----------------------------
+//     // 1️⃣ Page-level cache key
+//     // -----------------------------
+//     const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
+//     const pageCacheKey = `${baseCacheKey}&page${pageNum}`;
+
+//     const cachedPage = await getCache(pageCacheKey);
+//     if (cachedPage) {
+//       console.log(`✅ CACHE HIT for ${pageCacheKey}`);
+//       const parsed = JSON.parse(cachedPage);
+//       return res.status(200).json({ ...parsed, cached: true, from: "page-cache" });
+//     }
+//     console.log(`❌ CACHE MISS for ${pageCacheKey}`);
+
+//     // -----------------------------
+//     // 2️⃣ Load facilities from MongoDB
+//     // -----------------------------
+//     let facilities: any[] = [];
+//     if (lat && lng) {
+//       const latitude = parseFloat(lat);
+//       const longitude = parseFloat(lng);
+//       facilities = await Facility.find({
+//         geoLocation: {
+//           $near: {
+//             $geometry: { type: "Point", coordinates: [longitude, latitude] },
+//             $maxDistance: 50000,
+//           },
+//         },
+//       }).lean();
+//     } else if (q) {
+//       const { type, value } = normalizeQuery(q.trim());
+//       const mongoQuery: any = {};
+//       if (type === "zip") mongoQuery.zip_code = value;
+//       else if (type === "state") mongoQuery.state = new RegExp(`^${value}$`, "i");
+//       else mongoQuery.city_town = new RegExp(value, "i");
+//       facilities = await Facility.find(mongoQuery).lean();
+//     }
+
+//     if (!facilities.length) {
+//       return res.status(200).json({ data: [], total: 0 });
+//     }
+
+//     // -----------------------------
+//     // 3️⃣ Paginate DB results
+//     // -----------------------------
+//     const start = (pageNum - 1) * limitNum;
+//     const end = pageNum * limitNum;
+//     const pagedFacilities = facilities.slice(start, end);
+
+//     // -----------------------------
+//     // 4️⃣ Google + AI enrichment
+//     // -----------------------------
+//     const googleResults = await Promise.all(
+//       pagedFacilities.map((f) => getGoogleDataFast(f))
+//     );
+
+//     const reviewsTexts = pagedFacilities.map((_, i) =>
+//       googleResults[i]?.reviews?.length
+//         ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+//         : ""
+//     );
+
+//     const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+//     const pagedResults = pagedFacilities.map((facility, i) => {
+//       const gd = googleResults[i] ?? {};
+//       return {
+//         ...facility,
+//         googleName: gd.googleName ?? null,
+//         rating: gd.rating ?? null,
+//         photo: gd.photos?.[0] || null,
+//         lat: gd.lat ?? null,
+//         lng: gd.lng ?? null,
+//         aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+//       };
+//     });
+
+//     // -----------------------------
+//     // 5️⃣ Cache current page
+//     // -----------------------------
+//     await setCache(
+//       pageCacheKey,
+//       JSON.stringify({ data: pagedResults, total: facilities.length }),
+//       ONE_YEAR_MS
+//     );
+//     console.log(`💾 Cached ${pageCacheKey}`);
+
+//     // -----------------------------
+//     // 6️⃣ Progressive background caching every 6 pages
+//     // -----------------------------
+//     if (pageNum % 6 === 0) {
+//       console.log(`⚙️ Starting background caching for next 6 pages from page ${pageNum + 1}...`);
+
+//       (async () => {
+//         try {
+//           const nextStart = pageNum;
+//           const nextEnd = Math.min(pageNum + 6, Math.ceil(facilities.length / limitNum));
+//           const allToFetch = facilities.slice(nextStart * limitNum, nextEnd * limitNum);
+
+//           if (allToFetch.length === 0) {
+//             console.log("✅ No more facilities left to cache in background.");
+//             return;
+//           }
+
+//           console.log(
+//             `⏳ Background fetching Google+AI for pages ${nextStart + 1}–${nextEnd} (${allToFetch.length} facilities)`
+//           );
+
+//           const googleAllResults = await Promise.all(allToFetch.map((f) => getGoogleDataFast(f)));
+//           const allReviewsTexts = allToFetch.map((_, i) =>
+//             googleAllResults[i]?.reviews?.length
+//               ? googleAllResults[i].reviews.map((r: any) => r.text).join("\n")
+//               : ""
+//           );
+//           const allSummaries = await summarizeReviewsBatch(allReviewsTexts);
+
+//           const allFinalResults = allToFetch.map((f, i) => {
+//             const gd = googleAllResults[i] ?? {};
+//             return {
+//               ...f,
+//               googleName: gd.googleName ?? null,
+//               rating: gd.rating ?? null,
+//               photo: gd.photos?.[0] || null,
+//               lat: gd.lat ?? null,
+//               lng: gd.lng ?? null,
+//               aiSummary: allSummaries[i] || { summary: "", pros: [], cons: [] },
+//             };
+//           });
+
+//           for (let p = nextStart + 1; p <= nextEnd; p++) {
+//             const startIdx = (p - 1 - nextStart) * limitNum;
+//             const endIdx = startIdx + limitNum;
+//             const pageData = allFinalResults.slice(startIdx, endIdx);
+
+//             const nextPageKey = `${baseCacheKey}&page${p}`;
+//             await setCache(nextPageKey, JSON.stringify({ data: pageData, total: facilities.length }), ONE_YEAR_MS);
+//             console.log(`💾 Cached background page ${p} (${pageData.length} items)`);
+//           }
+
+//           console.log(`✅ Finished background caching for pages ${nextStart + 1}–${nextEnd}`);
+//         } catch (err) {
+//           console.error("❌ Progressive background caching error:", err);
+//         }
+//       })();
+//     }
+
+//     // -----------------------------
+//     // 7️⃣ Return result
+//     // -----------------------------
+//     return res.status(200).json({
+//       data: pagedResults,
+//       total: facilities.length,
+//       page: pageNum,
+//       limit: limitNum,
+//       cached: false,
+//       from: "db",
+//     });
+//   } catch (err: any) {
+//     console.error("❌ API error:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// };
+
+// export const searchFacilitiesWithReviews = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction
+// ) => {
+//   try {
+//     const { lat, lng, q, page = "1", limit = "8" } = req.query as {
+//       lat?: string;
+//       lng?: string;
+//       q?: string;
+//       page?: string;
+//       limit?: string;
+//     };
+
+//     const pageNum = parseInt(page);
+//     const limitNum = parseInt(limit);
+//     const cacheKey = SEARCH_CACHE_KEY({ lat, lng, q });
+
+//     // --- 1. Check Cache ---
+//     const cached = await getCache(cacheKey);
+//     if (cached) {
+//       console.log(`✅ CACHE HIT for ${cacheKey}`);
+//       const allData = JSON.parse(cached);
+//       const start = (pageNum - 1) * limitNum;
+//       const end = pageNum * limitNum;
+//       const paged = allData.slice(start, end);
+
+//       return res.status(200).json({
+//         data: paged,
+//         total: allData.length,
+//         cached: true,
+//       });
+//     }
+
+//     console.log(`❌ CACHE MISS for ${cacheKey}`);
+
+//     // --- 2. Get Facilities from DB ---
+//     let facilities: any[] = [];
+//     if (lat && lng) {
+//       const latitude = parseFloat(lat);
+//       const longitude = parseFloat(lng);
+//       facilities = await Facility.find({
+//         geoLocation: {
+//           $near: {
+//             $geometry: { type: "Point", coordinates: [longitude, latitude] },
+//             $maxDistance: 50000,
+//           },
+//         },
+//       }).lean();
+//     } else if (q) {
+//       const { type, value } = normalizeQuery(q.trim());
+//       const mongoQuery: any = {};
+//       if (type === "zip") mongoQuery.zip_code = value;
+//       else if (type === "state") mongoQuery.state = new RegExp(`^${value}$`, "i");
+//       else mongoQuery.city_town = new RegExp(value, "i");
+//       facilities = await Facility.find(mongoQuery).lean();
+//     }
+
+//     if (!facilities.length) {
+//       return res.status(200).json({ data: [], total: 0 });
+//     }
+
+//     // --- 3. Paginate ---
+//     const start = (pageNum - 1) * limitNum;
+//     const end = pageNum * limitNum;
+//     const pagedFacilities = facilities.slice(start, end);
+
+//     // --- 4. Fetch Google + AI ---
+//     let pagedResults: any[] = [];
+//     if (pageNum < 6) {
+//       // Fetch only per-page Google & AI data
+//       const googleResults = await Promise.all(
+//         pagedFacilities.map((f) => getGoogleDataFast(f))
+//       );
+
+//       const reviewsTexts = pagedFacilities.map((_, i) =>
+//         googleResults[i]?.reviews?.length
+//           ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+//           : ""
+//       );
+
+//       const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+//       pagedResults = pagedFacilities.map((facility, i) => {
+//         const googleData = googleResults[i] ?? {};
+//         return {
+//           ...facility,
+//           googleName: googleData.googleName ?? null,
+//           rating: googleData.rating ?? null,
+//           photo: googleData.photos?.[0] || null,
+//           lat: googleData.lat ?? null,
+//           lng: googleData.lng ?? null,
+//           aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+//         };
+//       });
+//     } else {
+//       // Page >=6 → fetch per-page Google + AI, but trigger background full caching
+//       const googleResults = await Promise.all(
+//         pagedFacilities.map((f) => getGoogleDataFast(f))
+//       );
+//       const reviewsTexts = pagedFacilities.map((_, i) =>
+//         googleResults[i]?.reviews?.length
+//           ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+//           : ""
+//       );
+//       const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+//       pagedResults = pagedFacilities.map((facility, i) => {
+//         const gd = googleResults[i] ?? {};
+//         return {
+//           ...facility,
+//           googleName: gd.googleName ?? null,
+//           rating: gd.rating ?? null,
+//           photo: gd.photos?.[0] || null,
+//           lat: gd.lat ?? null,
+//           lng: gd.lng ?? null,
+//           aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+//         };
+//       });
+
+//       // Trigger background caching for full dataset
+//       (async () => {
+//         try {
+//           const googleAllResults = await Promise.all(
+//             facilities.map((f) => getGoogleDataFast(f))
+//           );
+//           const allReviewsTexts = facilities.map((_, i) =>
+//             googleAllResults[i]?.reviews?.length
+//               ? googleAllResults[i].reviews.map((r: any) => r.text).join("\n")
+//               : ""
+//           );
+//           const allSummaries = await summarizeReviewsBatch(allReviewsTexts);
+//           const allFinalResults = facilities.map((f, i) => {
+//             const gd = googleAllResults[i] ?? {};
+//             return {
+//               ...f,
+//               googleName: gd.googleName ?? null,
+//               rating: gd.rating ?? null,
+//               photo: gd.photos?.[0] || null,
+//               lat: gd.lat ?? null,
+//               lng: gd.lng ?? null,
+//               aiSummary: allSummaries[i] || { summary: "", pros: [], cons: [] },
+//             };
+//           });
+//           await setCache(cacheKey, JSON.stringify(allFinalResults), ONE_YEAR_MS);
+//           console.log(`💾 Cached ${allFinalResults.length} results for ${cacheKey}`);
+//         } catch (err) {
+//           console.error("❌ Background caching error:", err);
+//         }
+//       })();
+//     }
+
+//     return res.status(200).json({
+//       data: pagedResults,
+//       total: facilities.length,
+//       cached: false,
+//     });
 //   } catch (err) {
-//     console.error("❌ Error in filterFacilitiesWithReviews:", err);
+//     console.error("❌ Error in searchFacilitiesWithReviews:", err);
 //     next(err);
 //   }
 // };
+
+// Helper: Clean facility names to improve Google Text Search hits
+function cleanFacilityName(name?: string | null): string {
+  if (!name) return "";
+  return name
+    .replace(/\b(LLC|INC|LTD|LP|CO|CORP|CORPORATION|COMPANY)\b/gi, "")
+    .replace(/\b(HEALTHCARE|HEALTH CARE|CARE CENTER|CARE CENTRE|CENTER|CENTRE)\b/gi, "")
+    .replace(/\bAT\b/gi, " ")
+    .replace(/[^A-Za-z0-9\s]/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Enhanced Google enrichment that tries better query variants
+async function fetchAndCacheGoogleDataEnhanced(facility: any) {
+  // First, attempt the existing fast cache-aware path
+  const cached = await fetchAndCacheGoogleData(facility);
+  if (cached && (cached.googleName || cached.rating || (cached.photos && cached.photos.length) || (cached.reviews && cached.reviews.length))) {
+    return cached;
+  }
+
+  // Build stronger query variants
+  const name = cleanFacilityName(facility.provider_name || facility.legal_business_name || "");
+  const city = (facility.city_town || "").trim();
+  const state = (facility.state || "").trim();
+  const zip = (facility.zip_code || "").trim();
+
+  const variants = [
+    `${name}, ${city}, ${state} ${zip}`.trim(),
+    `${name} ${city} ${state}`.trim(),
+    `${name} ${zip}`.trim(),
+    `${name} nursing home ${city} ${state}`.trim(),
+    `${facility.provider_name || ""}, ${city}, ${state} ${zip}`.trim(),
+    `${facility.legal_business_name || ""}, ${city}, ${state} ${zip}`.trim(),
+  ]
+    .map(v => v.replace(/\s{2,}/g, " ").trim())
+    .filter(v => v.length >= 3);
+
+  // Try sequentially for determinism and to stop at first hit
+  for (const query of variants) {
+    try {
+      const placeId = await findPlaceIdByText(query);
+      if (!placeId) continue;
+      const details = await getPlaceDetails(placeId);
+      if (!details) continue;
+
+      const photoReferences = (details.photos || []).slice(0, 4).map((p: any) => p.photo_reference);
+      return {
+        googleName: details.name ?? null,
+        rating: details.rating ?? null,
+        lat: details.lat ?? null,
+        lng: details.lng ?? null,
+        photos: photoReferences.map((ref: string) => googleService.getPhotoUrl(ref)).filter(Boolean),
+        reviews: (details.reviews || []).slice(0, 10).map((r: any) => ({
+          author_name: r.author_name,
+          rating: r.rating,
+          text: r.text,
+          relative_time_description: r.relative_time_description,
+          profile_photo_url: r.profile_photo_url,
+          author_url: r.author_url,
+        })),
+      };
+    } catch (e) {
+      // Ignore and try next variant
+    }
+  }
+
+  return cached || { googleName: null, rating: null, lat: null, lng: null, photos: [], reviews: [] };
+}
+
+
 
 export const filterFacilitiesWithReviews = async (
   req: Request,
@@ -822,6 +1578,7 @@ export const filterFacilitiesWithReviews = async (
       fromLocation,
       toLocation,
       ratingMin,
+       limit, 
     } = req.query as any;
 
     const pipeline: any[] = [];
@@ -933,9 +1690,13 @@ export const filterFacilitiesWithReviews = async (
       });
     }
 
+    // 🔢 9️⃣ APPLY LIMIT (default 50)
+    const resultsLimit = limit ? parseInt(limit) : 50;
+    pipeline.push({ $limit: resultsLimit });
+
     // 🚀 EXECUTE QUERY (no limit)
     const facilities = await Facility.aggregate(pipeline);
-    console.log(`✅ Found ${facilities.length} facilities`);
+    console.log(`✅ Found ${facilities.length} facilities (limited to ${resultsLimit})`);
 
     // 🧠 GOOGLE PLACE DATA
     const googleResults = await Promise.all(
@@ -1081,5 +1842,159 @@ export const fetchFromCMS = async (req: Request, res: Response, next: NextFuncti
   } catch (err: any) {
     console.error("CMS API error:", err.message);
     res.status(500).json({ error: "Failed to fetch CMS data" });
+  }
+};
+
+// 🚀 NEW: Optimized batch processing endpoint for Google data
+export const batchProcessFacilitiesGoogleData = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { facilityIds, limit = 50 } = req.body as { 
+      facilityIds?: string[], 
+      limit?: number 
+    };
+
+    if (!facilityIds || facilityIds.length === 0) {
+      return res.status(400).json({ 
+        message: "facilityIds array is required" 
+      });
+    }
+
+    // Limit batch size to prevent overwhelming the API
+    const maxBatchSize = Math.min(limit, 100);
+    const facilitiesToProcess = facilityIds.slice(0, maxBatchSize);
+
+    console.log(`🔄 Starting batch processing for ${facilitiesToProcess.length} facilities`);
+
+    // Fetch facility data from database
+    const facilities = await Facility.find({
+      _id: { $in: facilitiesToProcess }
+    }).select('_id provider_name zip_code city_town').lean();
+
+    if (facilities.length === 0) {
+      return res.status(404).json({ message: "No facilities found" });
+    }
+
+    // Convert to batch processing format
+    const facilityData: FacilityGoogleData[] = facilities
+      .filter(facility => facility.provider_name) // Filter out facilities without provider_name
+      .map(facility => ({
+        facilityId: facility._id.toString(),
+        providerName: facility.provider_name!, // Non-null assertion since we filtered above
+        zipCode: facility.zip_code || undefined,
+        cityTown: facility.city_town || undefined,
+      }));
+
+    // Process facilities in batches
+    const results = await batchProcessFacilities(facilityData);
+
+    // Update database with results
+    const updatePromises = results.map(async (result) => {
+      if (result.placeDetails) {
+        const cacheData = {
+          placeId: result.placeId,
+          googleName: result.placeDetails.name,
+          rating: result.placeDetails.rating,
+          lat: result.placeDetails.lat,
+          lng: result.placeDetails.lng,
+          photoReferences: result.placeDetails.photos.slice(0, 4).map(p => p.photo_reference),
+          reviews: result.placeDetails.reviews.slice(0, 10).map(r => ({
+            author_name: r.author_name,
+            rating: r.rating,
+            text: r.text,
+            relative_time_description: r.relative_time_description,
+            profile_photo_url: (r as any).profile_photo_url,
+            author_url: (r as any).author_url,
+          })),
+          lastUpdated: new Date(),
+        };
+
+        return Facility.updateOne(
+          { _id: result.facilityId },
+          { $set: { googleCache: cacheData } }
+        );
+      }
+      return null;
+    });
+
+    await Promise.allSettled(updatePromises.filter(Boolean));
+
+    const successCount = results.filter(r => r.placeId).length;
+    const apiStats = getApiUsageStats();
+
+    res.json({
+      message: `Batch processing complete: ${successCount}/${facilities.length} facilities processed successfully`,
+      results: results.map(r => ({
+        facilityId: r.facilityId,
+        success: !!r.placeId,
+        error: r.error || null,
+      })),
+      apiUsage: {
+        totalRequests: apiStats.totalRequests,
+        cacheHits: apiStats.cacheHits,
+        cacheMisses: apiStats.cacheMisses,
+        cacheHitRate: apiStats.totalRequests > 0 ? 
+          (apiStats.cacheHits / apiStats.totalRequests * 100).toFixed(2) + '%' : '0%',
+      },
+    });
+
+  } catch (err) {
+    console.error("❌ Error in batchProcessFacilitiesGoogleData:", err);
+    next(err);
+  }
+};
+
+// 📊 NEW: API usage monitoring endpoint
+export const getGoogleApiUsageStats = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const stats = getApiUsageStats();
+    
+    // Calculate estimated costs (rough estimates based on Google's pricing)
+    const estimatedCosts = {
+      textSearchRequests: (stats.requestsByType['place_id'] || 0) * 0.017, // $0.017 per request
+      placeDetailsRequests: (stats.requestsByType['place_details'] || 0) * 0.017, // $0.017 per request
+      geocodingRequests: (stats.requestsByType['coordinates'] || 0) * 0.005, // $0.005 per request
+    };
+
+    const totalEstimatedCost = Object.values(estimatedCosts).reduce((sum, cost) => sum + cost, 0);
+
+    res.json({
+      ...stats,
+      estimatedCosts,
+      totalEstimatedCost: totalEstimatedCost.toFixed(4),
+      recommendations: [
+        stats.cacheHits < stats.cacheMisses ? 
+          "Consider increasing cache TTL to reduce API calls" : 
+          "Good cache hit rate!",
+        stats.totalRequests > 1000 ? 
+          "High API usage detected. Consider implementing more aggressive caching." : 
+          "API usage is within reasonable limits.",
+      ],
+    });
+  } catch (err) {
+    console.error("❌ Error in getGoogleApiUsageStats:", err);
+    next(err);
+  }
+};
+
+// 🔄 NEW: Reset API usage stats endpoint
+export const resetGoogleApiUsageStats = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    resetApiUsageStats();
+    res.json({ message: "API usage stats reset successfully" });
+  } catch (err) {
+    console.error("❌ Error in resetGoogleApiUsageStats:", err);
+    next(err);
   }
 };

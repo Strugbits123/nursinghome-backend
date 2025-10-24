@@ -12,7 +12,7 @@ export interface IFacility extends Document {
   ownership?: string;
   bedCount?: number;
   rating?: number;
-  staffing?: Record<string, any>; // flexible JSON
+  staffing?: Record<string, any>;
   lastUpdated?: Date;
   createdAt?: Date;
   updatedAt?: Date;
@@ -30,7 +30,7 @@ const facilitySchema: Schema<IFacility> = new Schema(
     ownership: { type: String },
     bedCount: { type: Number },
     rating: { type: Number },
-    staffing: { type: Schema.Types.Mixed }, // flexible JSON
+    staffing: { type: Schema.Types.Mixed },
     lastUpdated: { type: Date, default: Date.now },
   },
   { timestamps: true }
