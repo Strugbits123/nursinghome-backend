@@ -1125,199 +1125,6 @@ type FacilityType = any;
 
 
 
-// COmmit from Now
-
-// export const searchFacilitiesWithReviews = async (
-//   req: Request,
-//   res: Response,
-//   next: NextFunction
-// ) => {
-//   try {
-//     const { lat, lng, q, page = "1", limit = "8" } = req.query as {
-//       lat?: string;
-//       lng?: string;
-//       q?: string;
-//       page?: string;
-//       limit?: string;
-//     };
-
-//     const pageNum = parseInt(page);
-//     const limitNum = parseInt(limit);
-
-//     const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
-//     const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
-
-//     // -----------------------------
-//     // 1️⃣ Redis Cache
-//     // -----------------------------
-//     const cachedRedis = await getCache(pageCacheKey);
-//     if (cachedRedis) {
-//       const parsed = JSON.parse(cachedRedis);
-//       if (!parsed.data?.length) {
-//         await deleteCache(pageCacheKey);
-//       } else {
-//         return res.status(200).json({ ...parsed, cached: true, from: "redis" });
-//       }
-//     }
-
-//     // -----------------------------
-//     // 2️⃣ Mongo Cache Collection
-//     // -----------------------------
-//     const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
-//     if (mongoCache) {
-//       if (!mongoCache.data?.data?.length) {
-//         await CachedSearchResult.deleteOne({ key: pageCacheKey });
-//       } else {
-//         await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
-//         return res
-//           .status(200)
-//           .json({ ...mongoCache.data, cached: true, from: "mongo-cache" });
-//       }
-//     }
-
-//     // -----------------------------
-//     // 3️⃣ Query Main Database
-//     // -----------------------------
-//     let mongoQuery: any = {};
-//     let facilities: any[] = [];
-//     let total = 0;
-
-//     if (lat && lng) {
-//       // Geo-based search
-//       const latitude = parseFloat(lat);
-//       const longitude = parseFloat(lng);
-
-//       mongoQuery = {
-//         geoLocation: {
-//           $near: {
-//             $geometry: { type: "Point", coordinates: [longitude, latitude] },
-//             $maxDistance: 50000, // 50km
-//           },
-//         },
-//         state: { $in: allowedAbbr },
-//       };
-
-//       total = await NursingFacility.countDocuments(mongoQuery);
-
-//       facilities = await NursingFacility.find(mongoQuery)
-//         .skip((pageNum - 1) * limitNum)
-//         .limit(limitNum)
-//         .lean();
-//     } else if (q) {
-//       // Text-based search
-//       const cleanedQuery = q.replace(/_/g, " ").trim();
-//       const { type, value } = normalizeQuery(cleanedQuery);
-
-//       if (type === "zip") {
-//         const stateOfZip = await NursingFacility.findOne({ zip_code: value })
-//           .select("state")
-//           .lean();
-//         const zipState = stateOfZip?.state ?? null;
-
-//         if (!zipState || !allowedAbbr.includes(zipState)) {
-//           return res.status(400).json({
-//             error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
-//           });
-//         }
-
-//         mongoQuery = { zip_code: value };
-//       } else if (type === "state") {
-//         const abbr = stateToAbbr[value] || value.toUpperCase();
-
-//         if (!allowedAbbr.includes(abbr)) {
-//           return res.status(400).json({
-//             error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
-//           });
-//         }
-
-//         mongoQuery = { state: abbr };
-//       } else {
-//         mongoQuery = {
-//           $or: [
-//             { city_town: new RegExp(value, "i") },
-//             { provider_name: new RegExp(value, "i") },
-//             { zip_code: new RegExp(value, "i") },
-//           ],
-//           state: { $in: allowedAbbr },
-//         };
-//       }
-
-//       total = await NursingFacility.countDocuments(mongoQuery);
-
-//       facilities = await NursingFacility.find(mongoQuery)
-//         .skip((pageNum - 1) * limitNum)
-//         .limit(limitNum)
-//         .lean();
-//     }
-
-//     // -----------------------------
-//     // 4️⃣ Empty Result Handling
-//     // -----------------------------
-//     if (!facilities.length) {
-//       await deleteCache(pageCacheKey);
-//       await CachedSearchResult.deleteOne({ key: pageCacheKey });
-
-//       return res.status(200).json({
-//         data: [],
-//         total: 0,
-//         page: pageNum,
-//         limit: limitNum,
-//         cached: false,
-//         from: "db",
-//       });
-//     }
-
-//     // -----------------------------
-//     // 5️⃣ Google + AI Enrichment
-//     // -----------------------------
-//     const googleResults = await Promise.all(facilities.map((f) => getGoogleDataFast(f)));
-//     const reviewsTexts = facilities.map((_: any, i: number) =>
-//       googleResults[i]?.reviews?.length
-//         ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
-//         : ""
-//     );
-//     const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
-
-//     const pagedResults = facilities.map((f: any, i: number) => {
-//       const gd = googleResults[i] ?? {};
-//       return {
-//         ...f,
-//         googleName: gd.googleName ?? null,
-//         rating: gd.rating ?? null,
-//         photo: gd.photos?.[0] || null,
-//         lat: gd.lat ?? null,
-//         lng: gd.lng ?? null,
-//         aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
-//       };
-//     });
-
-//     const responseData = {
-//       data: pagedResults,
-//       total,
-//       page: pageNum,
-//       limit: limitNum,
-//       cached: false,
-//       from: pageNum <= 6 ? "db" : "db+google+ai",
-//     };
-
-//     // -----------------------------
-//     // 6️⃣ Cache Non-Empty Results
-//     // -----------------------------
-//     if (responseData.data.length) {
-//       await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
-//       await CachedSearchResult.updateOne(
-//         { key: pageCacheKey },
-//         { $set: { data: responseData } },
-//         { upsert: true }
-//       );
-//     }
-
-//     return res.status(200).json(responseData);
-//   } catch (err: any) {
-//     console.error("❌ API error:", err);
-//     res.status(500).json({ error: err.message });
-//   }
-// };
 
 export const searchFacilitiesWithReviews = async (
   req: Request,
@@ -1336,19 +1143,36 @@ export const searchFacilitiesWithReviews = async (
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
 
-    console.log("🔹 Debug: Received query", { lat, lng, q, pageNum, limitNum });
+    const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
+    const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
 
     // -----------------------------
-    // 1️⃣ Skip Redis Cache
+    // 1️⃣ Redis Cache
     // -----------------------------
-    // const cachedRedis = await getCache(pageCacheKey);
-    // ...
+    const cachedRedis = await getCache(pageCacheKey);
+    if (cachedRedis) {
+      const parsed = JSON.parse(cachedRedis);
+      if (!parsed.data?.length) {
+        await deleteCache(pageCacheKey);
+      } else {
+        return res.status(200).json({ ...parsed, cached: true, from: "redis" });
+      }
+    }
 
     // -----------------------------
-    // 2️⃣ Skip Mongo Cache
+    // 2️⃣ Mongo Cache Collection
     // -----------------------------
-    // const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
-    // ...
+    const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
+    if (mongoCache) {
+      if (!mongoCache.data?.data?.length) {
+        await CachedSearchResult.deleteOne({ key: pageCacheKey });
+      } else {
+        await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
+        return res
+          .status(200)
+          .json({ ...mongoCache.data, cached: true, from: "mongo-cache" });
+      }
+    }
 
     // -----------------------------
     // 3️⃣ Query Main Database
@@ -1358,8 +1182,7 @@ export const searchFacilitiesWithReviews = async (
     let total = 0;
 
     if (lat && lng) {
-      console.log("🔹 Debug: Performing geo-based search");
-
+      // Geo-based search
       const latitude = parseFloat(lat);
       const longitude = parseFloat(lng);
 
@@ -1380,16 +1203,32 @@ export const searchFacilitiesWithReviews = async (
         .limit(limitNum)
         .lean();
     } else if (q) {
-      console.log("🔹 Debug: Performing text-based search");
-
+      // Text-based search
       const cleanedQuery = q.replace(/_/g, " ").trim();
       const { type, value } = normalizeQuery(cleanedQuery);
-      console.log("🔹 Debug: Normalized query", { type, value });
 
       if (type === "zip") {
+        const stateOfZip = await NursingFacility.findOne({ zip_code: value })
+          .select("state")
+          .lean();
+        const zipState = stateOfZip?.state ?? null;
+
+        if (!zipState || !allowedAbbr.includes(zipState)) {
+          return res.status(400).json({
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+          });
+        }
+
         mongoQuery = { zip_code: value };
       } else if (type === "state") {
         const abbr = stateToAbbr[value] || value.toUpperCase();
+
+        if (!allowedAbbr.includes(abbr)) {
+          return res.status(400).json({
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+          });
+        }
+
         mongoQuery = { state: abbr };
       } else {
         mongoQuery = {
@@ -1410,13 +1249,13 @@ export const searchFacilitiesWithReviews = async (
         .lean();
     }
 
-    console.log("🔹 Debug: Facilities fetched from DB", facilities.length);
-
     // -----------------------------
     // 4️⃣ Empty Result Handling
     // -----------------------------
     if (!facilities.length) {
-      console.log("⚠️ No facilities found in DB");
+      await deleteCache(pageCacheKey);
+      await CachedSearchResult.deleteOne({ key: pageCacheKey });
+
       return res.status(200).json({
         data: [],
         total: 0,
@@ -1457,10 +1296,20 @@ export const searchFacilitiesWithReviews = async (
       page: pageNum,
       limit: limitNum,
       cached: false,
-      from: "db",
+      from: pageNum <= 6 ? "db" : "db+google+ai",
     };
 
-    console.log("🔹 Debug: Returning response", { total: responseData.total });
+    // -----------------------------
+    // 6️⃣ Cache Non-Empty Results
+    // -----------------------------
+    if (responseData.data.length) {
+      await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
+      await CachedSearchResult.updateOne(
+        { key: pageCacheKey },
+        { $set: { data: responseData } },
+        { upsert: true }
+      );
+    }
 
     return res.status(200).json(responseData);
   } catch (err: any) {
@@ -1468,6 +1317,7 @@ export const searchFacilitiesWithReviews = async (
     res.status(500).json({ error: err.message });
   }
 };
+
 
 
 

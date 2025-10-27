@@ -76,7 +76,7 @@ const MONGODB_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/nursingh
 const connectDB = async () => {
   try {
     await mongoose.connect(MONGODB_URI, {
-      serverSelectionTimeoutMS: 30000,
+      serverSelectionTimeoutMS: 30000, 
     });
     console.log('✅ MongoDB Connected successfully.');
     // ✅ Start cron job after successful DB connection
