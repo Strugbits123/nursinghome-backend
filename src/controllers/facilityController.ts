@@ -1174,6 +1174,15 @@ export const searchFacilitiesWithReviews = async (
       }
     }
 
+    const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
+    const allowedAbbr = ["NY", "NJ", "CT", "PA"];
+    const stateToAbbr: Record<string, string> = {
+      "New York": "NY",
+      "New Jersey": "NJ",
+      "Connecticut": "CT",
+      "Pennsylvania": "PA",
+    };
+
     // -----------------------------
     // 3️⃣ Query Main Database
     // -----------------------------
@@ -1203,14 +1212,50 @@ export const searchFacilitiesWithReviews = async (
         .limit(limitNum)
         .lean();
     } else if (q) {
+      // // Text-based search
+      // const cleanedQuery = q.replace(/_/g, " ").trim();
+      // const { type, value } = normalizeQuery(cleanedQuery);
+
+      // if (type === "zip") {
+      //   const stateOfZip = await NursingFacility.findOne({ zip_code: value })
+      //     .select("state")
+      //     .lean();
+      //   const zipState = stateOfZip?.state ?? null;
+
+      //   if (!zipState || !allowedAbbr.includes(zipState)) {
+      //     return res.status(400).json({
+      //       error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+      //     });
+      //   }
+
+      //   mongoQuery = { zip_code: value };
+      // } else if (type === "state") {
+      //   const abbr = stateToAbbr[value] || value.toUpperCase();
+      //   console.log('alert guys')
+      //   if (!allowedAbbr.includes(abbr)) {
+      //     console.log('alert guys 12345')
+      //     return res.status(400).json({
+      //       error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+      //     });
+      //   }
+
+      //   mongoQuery = { state: abbr };
+      // } else {
+      //   mongoQuery = {
+      //     $or: [
+      //       { city_town: new RegExp(value, "i") },
+      //       { provider_name: new RegExp(value, "i") },
+      //       { zip_code: new RegExp(value, "i") },
+      //     ],
+      //     state: { $in: allowedAbbr },
+      //   };
+      // }
       // Text-based search
       const cleanedQuery = q.replace(/_/g, " ").trim();
       const { type, value } = normalizeQuery(cleanedQuery);
 
       if (type === "zip") {
-        const stateOfZip = await NursingFacility.findOne({ zip_code: value })
-          .select("state")
-          .lean();
+        const stateOfZip = await NursingFacility.findOne({ zip_code: value }).select("state").lean();
         const zipState = stateOfZip?.state ?? null;
 
         if (!zipState || !allowedAbbr.includes(zipState)) {
@@ -1225,11 +1270,24 @@ export const searchFacilitiesWithReviews = async (
 
         if (!allowedAbbr.includes(abbr)) {
           return res.status(400).json({
-            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+            error: `Sorry, we currently searches only for ${allowedStates.join(", ")}.`,
           });
         }
 
         mongoQuery = { state: abbr };
+      } else if (type === "city") {
+        // Check if city exists in allowed states
+        const facilityInCity = await NursingFacility.findOne({ city_town: new RegExp(value, "i") })
+          .select("state")
+          .lean();
+
+        if (!facilityInCity || !allowedAbbr.includes(facilityInCity.state ?? "")) {
+          return res.status(400).json({
+            error: `Sorry, we currently searches only for ${allowedStates.join(", ")}.`,
+          });
+        }
+
+        mongoQuery = { city_town: new RegExp(value, "i") };
       } else {
         mongoQuery = {
           $or: [
