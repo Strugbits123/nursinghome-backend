@@ -13,7 +13,7 @@ import { PlaceDetails,
   resetApiUsageStats } from "../services/googleService";
 import { summarizeReviews, summarizeReviewsBatch, SummarizeResult } from "../services/aiService";
 import Facility from "../models/NursingFacility"; 
-import { getCache, setCache } from "../config/redisClient";
+import { getCache, setCache, deleteCache } from "../config/redisClient";
 import CachedSearchResult from "../models/CachedSearchResult";
 
 
@@ -875,8 +875,6 @@ type FacilityType = any;
 
 
 
-
-// ✅ Main Search Function
 export const searchFacilitiesWithReviews = async (
 req: Request,
 res: Response,
@@ -894,61 +892,50 @@ limit?: string;
 const pageNum = parseInt(page);
 const limitNum = parseInt(limit);
 
-// ✅ Allowed states & abbreviations
-const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
-const allowedAbbr = ["NY", "NJ", "CT", "PA"];
-const stateToAbbr: Record<string, string> = {
-  "New York": "NY",
-  "New Jersey": "NJ",
-  "Connecticut": "CT",
-  "Pennsylvania": "PA",
-};
-
 const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
 const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
 
 // -----------------------------
-// 1️⃣ Redis Cache
+// 1️⃣ Try Redis cache
 // -----------------------------
 const cachedRedis = await getCache(pageCacheKey);
 if (cachedRedis) {
   console.log(`✅ Redis Cache HIT for ${pageCacheKey}`);
-  return res
-    .status(200)
-    .json({ ...JSON.parse(cachedRedis), cached: true, from: "redis" });
+  const parsed = JSON.parse(cachedRedis);
+  if (!parsed.data?.length) {
+    // ❌ Remove empty cache immediately
+    console.log(`🧹 Removing empty Redis cache for ${pageCacheKey}`);
+    await deleteCache(pageCacheKey);
+  } else {
+    return res.status(200).json({ ...parsed, cached: true, from: "redis" });
+  }
 }
 
 // -----------------------------
-// 2️⃣ Mongo Cache
+// 2️⃣ Try Mongo Cache collection
 // -----------------------------
 const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
 if (mongoCache) {
   console.log(`✅ Mongo Cache HIT for ${pageCacheKey}`);
-  await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
-  return res
-    .status(200)
-    .json({ ...mongoCache.data, cached: true, from: "mongo-cache" });
+  if (!mongoCache.data?.data?.length) {
+    // ❌ Remove empty mongo cache
+    console.log(`🧹 Removing empty Mongo cache for ${pageCacheKey}`);
+    await CachedSearchResult.deleteOne({ key: pageCacheKey });
+  } else {
+    // Restore Redis for speed
+    await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
+    return res.status(200).json({ ...mongoCache.data, cached: true, from: "mongo-cache" });
+  }
 }
 
 // -----------------------------
 // 3️⃣ Query Main DB
 // -----------------------------
 let facilities: any[] = [];
-let totalFacilities = 0;
 
 if (lat && lng) {
   const latitude = parseFloat(lat);
   const longitude = parseFloat(lng);
-
-  totalFacilities = await Facility.countDocuments({
-    geoLocation: {
-      $near: {
-        $geometry: { type: "Point", coordinates: [longitude, latitude] },
-        $maxDistance: 50000,
-      },
-    },
-    state: { $in: allowedAbbr },
-  });
 
   facilities = await Facility.find({
     geoLocation: {
@@ -972,47 +959,24 @@ if (lat && lng) {
 
     if (!zipState || !allowedAbbr.includes(zipState)) {
       return res.status(400).json({
-        error: `❌ Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+        error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
       });
     }
+
     mongoQuery.zip_code = value;
   } else if (type === "state") {
-    // ✅ Block unsupported states early
-    const normalized = value.toUpperCase();
-    const validState =
-      allowedAbbr.includes(normalized) ||
-      Object.keys(stateToAbbr).some(
-        (st) => st.toLowerCase() === value.toLowerCase()
-      );
-
-    if (!validState) {
+    if (!allowedAbbr.includes(value)) {
       return res.status(400).json({
-        error: `❌ Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+        error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
       });
     }
-
-    // ✅ Support full name or abbreviation
-    if (allowedAbbr.includes(normalized)) {
-      mongoQuery.state = new RegExp(`^${normalized}$`, "i");
-    } else {
-      mongoQuery.state = new RegExp(
-        `^${stateToAbbr[value as keyof typeof stateToAbbr]}$`,
-        "i"
-      );
-    }
+    mongoQuery.state = new RegExp(`^${value}$`, "i");
   } else {
     mongoQuery.$and = [
-      {
-        $or: [
-          { city_town: new RegExp(value, "i") },
-          { name: new RegExp(value, "i") },
-        ],
-      },
+      { $or: [{ city_town: new RegExp(value, "i") }, { name: new RegExp(value, "i") }] },
       { state: { $in: allowedAbbr } },
     ];
   }
-
-  totalFacilities = await Facility.countDocuments(mongoQuery);
 
   facilities = await Facility.find(mongoQuery)
     .skip((pageNum - 1) * limitNum)
@@ -1020,19 +984,38 @@ if (lat && lng) {
     .lean();
 }
 
+const totalFacilities = facilities.length;
+
 // -----------------------------
-// 4️⃣ Google + AI Enrichment
+// 4️⃣ Remove empty cache entries if no data
+// -----------------------------
+if (totalFacilities === 0) {
+  console.log(`⚠️ No facilities found — removing any stale cache`);
+  await deleteCache(pageCacheKey);
+  await CachedSearchResult.deleteOne({ key: pageCacheKey });
+
+  return res.status(200).json({
+    data: [],
+    total: 0,
+    page: pageNum,
+    limit: limitNum,
+    cached: false,
+    from: "db",
+  });
+}
+
+// -----------------------------
+// 5️⃣ Google + AI enrichment
 // -----------------------------
 const googleResults = await Promise.all(facilities.map((f) => getGoogleDataFast(f)));
-const reviewsTexts = facilities.map((_, i) =>
+const reviewsTexts = facilities.map((_: any, i: number) =>
   googleResults[i]?.reviews?.length
     ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
     : ""
 );
-
 const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
 
-const pagedResults = facilities.map((f, i) => {
+const pagedResults = facilities.map((f: any, i: number) => {
   const gd = googleResults[i] ?? {};
   return {
     ...f,
@@ -1045,9 +1028,6 @@ const pagedResults = facilities.map((f, i) => {
   };
 });
 
-// -----------------------------
-// 5️⃣ Response
-// -----------------------------
 const responseData = {
   data: pagedResults,
   total: totalFacilities,
@@ -1058,14 +1038,16 @@ const responseData = {
 };
 
 // -----------------------------
-// 6️⃣ Store in Cache
+// 6️⃣ Cache results only if non-empty
 // -----------------------------
-await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
-await CachedSearchResult.updateOne(
-  { key: pageCacheKey },
-  { $set: { data: responseData } },
-  { upsert: true }
-);
+if (responseData.data.length > 0) {
+  await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
+  await CachedSearchResult.updateOne(
+    { key: pageCacheKey },
+    { $set: { data: responseData } },
+    { upsert: true }
+  );
+}
 
 return res.status(200).json(responseData);
 
