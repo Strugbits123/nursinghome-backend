@@ -15,6 +15,7 @@ import { summarizeReviews, summarizeReviewsBatch, SummarizeResult } from "../ser
 import Facility from "../models/NursingFacility"; 
 import { getCache, setCache, deleteCache } from "../config/redisClient";
 import CachedSearchResult from "../models/CachedSearchResult";
+import NursingFacility from "../models/NursingFacility";
 
 
 
@@ -978,7 +979,7 @@ export const searchFacilitiesWithReviews = async (
       const latitude = parseFloat(lat);
       const longitude = parseFloat(lng);
 
-      facilities = await Facility.find({
+      facilities = await NursingFacility.find({
         geoLocation: {
           $near: {
             $geometry: { type: "Point", coordinates: [longitude, latitude] },
@@ -997,7 +998,7 @@ export const searchFacilitiesWithReviews = async (
       const mongoQuery: any = {};
 
       if (type === "zip") {
-        const stateOfZip = await Facility.findOne({ zip_code: value })
+        const stateOfZip = await NursingFacility.findOne({ zip_code: value })
           .select("state")
           .lean();
         const zipState = stateOfZip?.state ?? null;
@@ -1039,7 +1040,7 @@ export const searchFacilitiesWithReviews = async (
         ];
       }
 
-      facilities = await Facility.find(mongoQuery)
+      facilities = await NursingFacility.find(mongoQuery)
         .skip((pageNum - 1) * limitNum)
         .limit(limitNum)
         .lean();
