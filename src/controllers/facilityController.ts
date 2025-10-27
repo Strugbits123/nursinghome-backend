@@ -1212,59 +1212,39 @@ export const searchFacilitiesWithReviews = async (
         .limit(limitNum)
         .lean();
     } else if (q) {
-      // // Text-based search
-      // const cleanedQuery = q.replace(/_/g, " ").trim();
-      // const { type, value } = normalizeQuery(cleanedQuery);
-
-      // if (type === "zip") {
-      //   const stateOfZip = await NursingFacility.findOne({ zip_code: value })
-      //     .select("state")
-      //     .lean();
-      //   const zipState = stateOfZip?.state ?? null;
-
-      //   if (!zipState || !allowedAbbr.includes(zipState)) {
-      //     return res.status(400).json({
-      //       error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
-      //     });
-      //   }
-
-      //   mongoQuery = { zip_code: value };
-      // } else if (type === "state") {
-      //   const abbr = stateToAbbr[value] || value.toUpperCase();
-      //   console.log('alert guys')
-      //   if (!allowedAbbr.includes(abbr)) {
-      //     console.log('alert guys 12345')
-      //     return res.status(400).json({
-      //       error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
-      //     });
-      //   }
-
-      //   mongoQuery = { state: abbr };
-      // } else {
-      //   mongoQuery = {
-      //     $or: [
-      //       { city_town: new RegExp(value, "i") },
-      //       { provider_name: new RegExp(value, "i") },
-      //       { zip_code: new RegExp(value, "i") },
-      //     ],
-      //     state: { $in: allowedAbbr },
-      //   };
-      // }
+     
       // Text-based search
       const cleanedQuery = q.replace(/_/g, " ").trim();
       const { type, value } = normalizeQuery(cleanedQuery);
 
       if (type === "zip") {
-        const stateOfZip = await NursingFacility.findOne({ zip_code: value }).select("state").lean();
-        const zipState = stateOfZip?.state ?? null;
+         const zipNumber = parseInt(value, 10);
+          if (isNaN(zipNumber)) {
+            return res.status(400).json({
+              error: `Invalid ZIP code "${value}".`,
+            });
+          }
+          
+          // Find facility with this ZIP
+          const facilityZip = await NursingFacility.findOne({ zip_code: zipNumber }).select("state").lean();
 
-        if (!zipState || !allowedAbbr.includes(zipState)) {
-          return res.status(400).json({
-            error: `Sorry, we currently searches only for ${allowedStates.join(", ")}.`,
-          });
-        }
+          if (!facilityZip) {
+            return res.status(400).json({
+              error: `Sorry, ZIP code "${zipNumber}" is not found in our database.`,
+            });
+          }
 
-        mongoQuery = { zip_code: value };
+          // Normalize state from DB to match allowedAbbr
+          const zipStateNormalized = facilityZip.state?.trim().toUpperCase() || null;
+
+          if (!zipStateNormalized || !allowedAbbr.includes(zipStateNormalized)) {
+            return res.status(400).json({
+              error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+            });
+          }
+
+          mongoQuery = { zip_code: zipNumber, state: zipStateNormalized };
+
       } else if (type === "state") {
         const abbr = stateToAbbr[value] || value.toUpperCase();
 
@@ -2024,6 +2004,183 @@ async function fetchAndCacheGoogleDataEnhanced(facility: any) {
 
 
 
+// export const filterFacilitiesWithReviews = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction
+// ) => {
+//   try {
+//     const {
+//       city,
+//       state,
+//       zip,
+//       bedsMin,
+//       bedsMax,
+//       ownership,
+//       distanceKm,
+//       userLat,
+//       userLng,
+//       locationName,
+//       fromLocation,
+//       toLocation,
+//       ratingMin,
+//        limit, 
+//     } = req.query as any;
+
+//     const pipeline: any[] = [];
+//     const matchQuery: any = {};
+//     let finalLat: number | null = null;
+//     let finalLng: number | null = null;
+//     let finalDistanceKm: number | null = null;
+//     let fromToDistanceKm: number | null = null;
+//     let isGeoSearch = false;
+
+//     // 🗺️ 1️⃣ FROM → TO SEARCH
+//     if (fromLocation && toLocation) {
+//       isGeoSearch = true;
+//       console.log("🚀 Performing FROM-TO search...");
+
+//       const fromCoords = await googleService.getCoordinatesByPlaceName(fromLocation);
+//       const toCoords = await googleService.getCoordinatesByPlaceName(toLocation);
+
+//       // Haversine formula
+//       const R = 6371;
+//       const dLat = ((toCoords.lat - fromCoords.lat) * Math.PI) / 180;
+//       const dLon = ((toCoords.lng - fromCoords.lng) * Math.PI) / 180;
+//       const a =
+//         Math.sin(dLat / 2) ** 2 +
+//         Math.cos((fromCoords.lat * Math.PI) / 180) *
+//           Math.cos((toCoords.lat * Math.PI) / 180) *
+//           Math.sin(dLon / 2) ** 2;
+//       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+//       fromToDistanceKm = R * c;
+
+//       finalLat = (fromCoords.lat + toCoords.lat) / 2;
+//       finalLng = (fromCoords.lng + toCoords.lng) / 2;
+//       finalDistanceKm = fromToDistanceKm / 2 + 50;
+//     }
+
+//     // 📍 2️⃣ USER LOCATION SEARCH
+//     else if (userLat && userLng) {
+//       isGeoSearch = true;
+//       finalLat = parseFloat(userLat);
+//       finalLng = parseFloat(userLng);
+//       finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+//     }
+
+//     // 🧭 3️⃣ LOCATION NAME SEARCH
+//     else if (locationName) {
+//       isGeoSearch = true;
+//       const coords = await googleService.getCoordinatesByPlaceName(locationName);
+//       finalLat = coords.lat;
+//       finalLng = coords.lng;
+//       finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+//     }
+
+//     // 🏙️ 4️⃣ CITY / STATE / ZIP FILTERS
+//     if (city) matchQuery.city_town = new RegExp(city, "i");
+//     if (state) matchQuery.state = state.toUpperCase();
+//     if (zip) matchQuery.zip_code = zip;
+
+//     // 🏠 5️⃣ OWNERSHIP TYPE
+//     if (ownership) {
+//       const ownershipArray = ownership.split(",").map((o: string) => o.trim());
+//       matchQuery.ownership_type = { $in: ownershipArray };
+//     }
+
+//     // 🛏️ 6️⃣ BEDS RANGE FILTER
+//     if (bedsMin || bedsMax) {
+//       matchQuery.number_of_certified_beds = {};
+//       if (bedsMin) matchQuery.number_of_certified_beds.$gte = parseInt(bedsMin);
+//       if (bedsMax) matchQuery.number_of_certified_beds.$lte = parseInt(bedsMax);
+//     }
+
+//     // 🌎 7️⃣ GEO FILTER (optional)
+//     if (isGeoSearch && finalLat && finalLng) {
+//       pipeline.push({
+//         $geoNear: {
+//           near: { type: "Point", coordinates: [finalLng, finalLat] },
+//           distanceField: "distance_m",
+//           key: "geoLocation",
+//           maxDistance: (finalDistanceKm || 20) * 1000, // meters
+//           spherical: true,
+//           query: matchQuery,
+//         },
+//       });
+//     } else {
+//       pipeline.push({ $match: matchQuery });
+//     }
+
+//     // ⭐ 8️⃣ RATING FILTER
+//     const ratingMinNum = ratingMin ? parseInt(ratingMin) : null;
+//     if (ratingMinNum && ratingMinNum >= 1 && ratingMinNum <= 5) {
+//       pipeline.push({
+//         $addFields: {
+//           numeric_overall_rating: {
+//             $cond: {
+//               if: {
+//                 $and: [
+//                   { $ifNull: ["$overall_rating", false] },
+//                   { $ne: ["$overall_rating", ""] },
+//                 ],
+//               },
+//               then: { $toDouble: "$overall_rating" },
+//               else: 0,
+//             },
+//           },
+//         },
+//       });
+
+//       pipeline.push({
+//         $match: { numeric_overall_rating: { $gte: ratingMinNum } },
+//       });
+//     }
+
+//     // 🔢 9️⃣ APPLY LIMIT (default 50)
+//     const resultsLimit = limit ? parseInt(limit) : 10;
+//     pipeline.push({ $limit: resultsLimit });
+
+//     // 🚀 EXECUTE QUERY (no limit)
+//     const facilities = await Facility.aggregate(pipeline);
+//     console.log(`✅ Found ${facilities.length} facilities (limited to ${resultsLimit})`);
+
+//     // 🧠 GOOGLE PLACE DATA
+//     const googleResults = await Promise.all(
+//       facilities.map((f: any) => fetchAndCacheGoogleData(f))
+//     );
+
+//     const finalResults = facilities.map((f: any, i: number) => {
+//       const g = googleResults[i];
+//       return {
+//         ...f,
+//         distance_km: f.distance_m ? f.distance_m / 1000 : null,
+//         googleName: g?.googleName,
+//         rating: g?.rating,
+//         photo: g?.photos?.[0] || null,
+//         lat: g?.lat || f.latitude,
+//         lng: g?.lng || f.longitude,
+//         aiSummary: { summary: "", pros: [], cons: [] },
+//       };
+//     });
+
+//     // 📦 RESPONSE
+//     const response: any = { facilities: finalResults };
+//     if (fromLocation && toLocation) {
+//       response.fromLocation = fromLocation;
+//       response.toLocation = toLocation;
+//       response.fromToDistanceKm = fromToDistanceKm;
+//     } else if (isGeoSearch && finalLat && finalLng) {
+//       response.centerCoords = { lat: finalLat, lng: finalLng };
+//     }
+
+//     res.json(response);
+//   } catch (err) {
+//     console.error("❌ Error in filterFacilitiesWithReviews:", err);
+//     next(err);
+//   }
+// };
+
+
 export const filterFacilitiesWithReviews = async (
   req: Request,
   res: Response,
@@ -2044,7 +2201,7 @@ export const filterFacilitiesWithReviews = async (
       fromLocation,
       toLocation,
       ratingMin,
-       limit, 
+      limit,
     } = req.query as any;
 
     const pipeline: any[] = [];
@@ -2058,26 +2215,35 @@ export const filterFacilitiesWithReviews = async (
     // 🗺️ 1️⃣ FROM → TO SEARCH
     if (fromLocation && toLocation) {
       isGeoSearch = true;
-      console.log("🚀 Performing FROM-TO search...");
+      try {
+        const fromCoords = await googleService.getCoordinatesByPlaceName(
+          fromLocation.replace(/_/g, " ")
+        );
+        const toCoords = await googleService.getCoordinatesByPlaceName(
+          toLocation.replace(/_/g, " ")
+        );
 
-      const fromCoords = await googleService.getCoordinatesByPlaceName(fromLocation);
-      const toCoords = await googleService.getCoordinatesByPlaceName(toLocation);
+        // Haversine formula
+        const R = 6371;
+        const dLat = ((toCoords.lat - fromCoords.lat) * Math.PI) / 180;
+        const dLon = ((toCoords.lng - fromCoords.lng) * Math.PI) / 180;
+        const a =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos((fromCoords.lat * Math.PI) / 180) *
+            Math.cos((toCoords.lat * Math.PI) / 180) *
+            Math.sin(dLon / 2) ** 2;
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        fromToDistanceKm = R * c;
 
-      // Haversine formula
-      const R = 6371;
-      const dLat = ((toCoords.lat - fromCoords.lat) * Math.PI) / 180;
-      const dLon = ((toCoords.lng - fromCoords.lng) * Math.PI) / 180;
-      const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos((fromCoords.lat * Math.PI) / 180) *
-          Math.cos((toCoords.lat * Math.PI) / 180) *
-          Math.sin(dLon / 2) ** 2;
-      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      fromToDistanceKm = R * c;
-
-      finalLat = (fromCoords.lat + toCoords.lat) / 2;
-      finalLng = (fromCoords.lng + toCoords.lng) / 2;
-      finalDistanceKm = fromToDistanceKm / 2 + 50;
+        finalLat = (fromCoords.lat + toCoords.lat) / 2;
+        finalLng = (fromCoords.lng + toCoords.lng) / 2;
+        finalDistanceKm = fromToDistanceKm / 2 + 50;
+      } catch (err: any) {
+        console.error("Google FROM-TO error:", err);
+        return res.status(400).json({
+          message: "Failed to fetch coordinates for FROM/TO locations.",
+        });
+      }
     }
 
     // 📍 2️⃣ USER LOCATION SEARCH
@@ -2088,13 +2254,23 @@ export const filterFacilitiesWithReviews = async (
       finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
     }
 
-    // 🧭 3️⃣ LOCATION NAME SEARCH
+    // 🧭 3️⃣ LOCATION NAME SEARCH (Reverted to Geocoding for proximity search)
     else if (locationName) {
       isGeoSearch = true;
-      const coords = await googleService.getCoordinatesByPlaceName(locationName);
-      finalLat = coords.lat;
-      finalLng = coords.lng;
-      finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+      try {
+        const coords = await googleService.getCoordinatesByPlaceName(
+          locationName.replace(/_/g, " ")
+        );
+        finalLat = coords.lat;
+        finalLng = coords.lng;
+        finalDistanceKm = distanceKm ? parseFloat(distanceKm) : 20;
+      } catch (err: any) {
+        console.error("Google locationName error:", err);
+        // This is the error return path if Google Geocoding fails to find the place name
+        return res.status(400).json({
+          message: `Failed to fetch coordinates for "${locationName}". Please check the input.`,
+        });
+      }
     }
 
     // 🏙️ 4️⃣ CITY / STATE / ZIP FILTERS
@@ -2128,6 +2304,7 @@ export const filterFacilitiesWithReviews = async (
         },
       });
     } else {
+      // This path is taken for City/State/Zip filters, Beds filters, or if locationName was provided but geo-search couldn't be performed (e.g., if there was no distanceKm or the user provided locationName was not found and we didn't want to show an error yet)
       pipeline.push({ $match: matchQuery });
     }
 
@@ -2160,7 +2337,7 @@ export const filterFacilitiesWithReviews = async (
     const resultsLimit = limit ? parseInt(limit) : 10;
     pipeline.push({ $limit: resultsLimit });
 
-    // 🚀 EXECUTE QUERY (no limit)
+    // 🚀 EXECUTE QUERY
     const facilities = await Facility.aggregate(pipeline);
     console.log(`✅ Found ${facilities.length} facilities (limited to ${resultsLimit})`);
 
@@ -2196,7 +2373,7 @@ export const filterFacilitiesWithReviews = async (
     res.json(response);
   } catch (err) {
     console.error("❌ Error in filterFacilitiesWithReviews:", err);
-    next(err);
+    res.status(500).json({ message: "Internal server error." });
   }
 };
 
