@@ -79,7 +79,7 @@ const connectDB = async () => {
     });
     console.log('✅ MongoDB Connected successfully.');
     // ✅ Start cron job after successful DB connection
-    startFacilitySyncCron();
+    // startFacilitySyncCron();
        
     const PORT: number = Number(process.env.PORT) || 5000;
     app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
