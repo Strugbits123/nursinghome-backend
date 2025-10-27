@@ -524,14 +524,14 @@ export const getFacilityDetails = async (
 // }
 
 // ✅ Allowed states
-// const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
-// const allowedAbbr = ["NY", "NJ", "CT", "PA"];
-// const stateToAbbr: Record<string, string> = {
-// "New York": "NY",
-// "New Jersey": "NJ",
-// "Connecticut": "CT",
-// "Pennsylvania": "PA",
-// };
+const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
+const allowedAbbr = ["NY", "NJ", "CT", "PA"];
+const stateToAbbr: Record<string, string> = {
+"New York": "NY",
+"New Jersey": "NJ",
+"Connecticut": "CT",
+"Pennsylvania": "PA",
+};
 
 
 // ✅ Detect ZIP / State / City
