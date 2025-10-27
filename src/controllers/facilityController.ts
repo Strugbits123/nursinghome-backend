@@ -1260,7 +1260,7 @@ export const searchFacilitiesWithReviews = async (
 
         if (!zipState || !allowedAbbr.includes(zipState)) {
           return res.status(400).json({
-            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+            error: `Sorry, we currently searches only for ${allowedStates.join(", ")}.`,
           });
         }
 
