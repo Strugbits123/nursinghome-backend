@@ -1,5 +1,4 @@
 import { Request, Response, NextFunction } from "express";
-// import Facility, { IFacility } from "../models/facilityModel";
 import * as cmsService from "../services/cmsService";
 import * as googleService from "../services/googleService";
 import axios from "axios";
@@ -15,6 +14,7 @@ import { PlaceDetails,
 import { summarizeReviews, summarizeReviewsBatch, SummarizeResult } from "../services/aiService";
 import Facility from "../models/NursingFacility"; 
 import { getCache, setCache } from "../config/redisClient";
+import CachedSearchResult from "../models/CachedSearchResult";
 
 
 
@@ -484,54 +484,70 @@ export const getFacilityDetails = async (
 
 
 // ✅ Map of states (Full Name → Abbreviation)
-const stateToAbbr: Record<string, string> = {
-  "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
-  "Colorado": "CO", "Connecticut": "CT", "Delware": "DE", "Florida": "FL", "Georgia": "GA",
-  "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
-  "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
-  "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
-  "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH",
-  "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY", "North Carolina": "NC",
-  "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA",
-  "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD", "Tennessee": "TN",
-  "Texas": "TX", "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA",
-  "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY"
-};
+// const stateToAbbr: Record<string, string> = {
+//   "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
+//   "Colorado": "CO", "Connecticut": "CT", "Delware": "DE", "Florida": "FL", "Georgia": "GA",
+//   "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
+//   "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+//   "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+//   "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH",
+//   "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY", "North Carolina": "NC",
+//   "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA",
+//   "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD", "Tennessee": "TN",
+//   "Texas": "TX", "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA",
+//   "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY"
+// };
 
 // ✅ Detects query type and normalizes state names
+
 // function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
-//   const zipRegex = /^\d{5}$/; // 5-digit ZIP Code (like "07001")
-//   if (zipRegex.test(q)) return { type: "zip", value: q };
+//   const cleanQ = q.trim().toLowerCase();
+//   const zipRegex = /^\d{5}$/;
+//   if (zipRegex.test(cleanQ)) {
+//     console.log("🔍 Query detected as ZIP:", cleanQ);
+//     return { type: "zip", value: cleanQ };
+//   }
 
-//   // Check if full state name → convert to abbreviation
-//   const stateMatch = Object.keys(stateToAbbr).find(
-//     state => state.toLowerCase() === q.toLowerCase()
+//   // Check full state name exact or starts with partial
+//   const stateMatch = Object.keys(stateToAbbr).find(state =>
+//     state.toLowerCase() === cleanQ || state.toLowerCase().startsWith(cleanQ)
 //   );
-//   if (stateMatch) return { type: "state", value: stateToAbbr[stateMatch] };
 
-//   // Otherwise, treat as city
+//   if (stateMatch) {
+//     console.log(`🔍 Query detected as STATE: "${q}" → Abbreviation: "${stateToAbbr[stateMatch]}"`);
+//     return { type: "state", value: stateToAbbr[stateMatch] };
+//   }
+
+//   console.log("🔍 Query detected as CITY:", q);
 //   return { type: "city", value: q };
 // }
 
+
+// ✅ Allowed states
+const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
+const allowedAbbr = ["NY", "NJ", "CT", "PA"];
+
+// ✅ State to abbreviation map
+const stateToAbbr: Record<string, string> = {
+  "New York": "NY",
+  "New Jersey": "NJ",
+  "Connecticut": "CT",
+  "Pennsylvania": "PA",
+};
+
+// ✅ Detect ZIP / State / City
 function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
   const cleanQ = q.trim().toLowerCase();
   const zipRegex = /^\d{5}$/;
-  if (zipRegex.test(cleanQ)) {
-    console.log("🔍 Query detected as ZIP:", cleanQ);
-    return { type: "zip", value: cleanQ };
-  }
 
-  // Check full state name exact or starts with partial
-  const stateMatch = Object.keys(stateToAbbr).find(state =>
-    state.toLowerCase() === cleanQ || state.toLowerCase().startsWith(cleanQ)
+  if (zipRegex.test(cleanQ)) return { type: "zip", value: cleanQ };
+
+  const stateMatch = Object.keys(stateToAbbr).find(
+    (state) => state.toLowerCase() === cleanQ || state.toLowerCase().startsWith(cleanQ)
   );
 
-  if (stateMatch) {
-    console.log(`🔍 Query detected as STATE: "${q}" → Abbreviation: "${stateToAbbr[stateMatch]}"`);
-    return { type: "state", value: stateToAbbr[stateMatch] };
-  }
+  if (stateMatch) return { type: "state", value: stateToAbbr[stateMatch] };
 
-  console.log("🔍 Query detected as CITY:", q);
   return { type: "city", value: q };
 }
 
@@ -710,104 +726,17 @@ function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: str
 type FacilityType = any; 
 
 
-export const searchFacilitiesWithReviews = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const { q, page = "1", limit = "8" } = req.query as {
-      q?: string;
-      page?: string;
-      limit?: string;
-    };
-
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-
-    if (!q) return res.status(400).json({ message: "Missing search query" });
-
-    const redisKey = `search:query:${q.toLowerCase()}`;
-
-    // -----------------------------
-    // 1️⃣ Get all data from cache
-    // -----------------------------
-    const raw = await getCache(redisKey);
-    if (!raw) return res.status(200).json({ data: [], total: 0 });
-
-    const allData = JSON.parse(raw);
-    const total = allData.length;
-
-    // -----------------------------
-    // 2️⃣ Paginate
-    // -----------------------------
-    const startIdx = (pageNum - 1) * limitNum;
-    const endIdx = pageNum * limitNum;
-    const pagedData = allData.slice(startIdx, endIdx);
-
-    // -----------------------------
-    // 3️⃣ Google + AI enrichment
-    // -----------------------------
-    const googleResults = await Promise.all(
-      pagedData.map((f: FacilityType) => getGoogleDataFast(f))
-    );
-
-    const reviewsTexts = pagedData.map((_: FacilityType, i: number) =>
-      googleResults[i]?.reviews?.length
-        ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
-        : ""
-    );
-
-    const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
-
-    const pagedResults = pagedData.map((f: FacilityType, i: number) => {
-      const gd = googleResults[i] ?? {};
-      return {
-        ...f,
-        googleName: gd.googleName ?? null,
-        rating: gd.rating ?? null,
-        photo: gd.photos?.[0] || null,
-        lat: gd.lat ?? null,
-        lng: gd.lng ?? null,
-        aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
-      };
-    });
-
-    // -----------------------------
-    // 4️⃣ Cache current page
-    // -----------------------------
-    const pageCacheKey = `facility:query:${q.toLowerCase()}&page${pageNum}`;
-    await setCache(pageCacheKey, JSON.stringify({ data: pagedResults, total }), ONE_YEAR_MS);
-
-    // -----------------------------
-    // 5️⃣ Return current page
-    // -----------------------------
-    return res.status(200).json({
-      data: pagedResults,
-      total,
-      page: pageNum,
-      limit: limitNum,
-      cached: true,
-      from: "cache-only",
-    });
-
-  } catch (err: any) {
-    console.error("❌ API error:", err);
-    res.status(500).json({ error: err.message });
-  }
-};
 
 
-
-
-// Lasssssssssst Code 
 // export const searchFacilitiesWithReviews = async (
 //   req: Request,
 //   res: Response,
 //   next: NextFunction
 // ) => {
 //   try {
-//     const { q, page = "1", limit = "8" } = req.query as {
+//     const { lat, lng, q, page = "1", limit = "8" } = req.query as {
+//       lat?: string;
+//       lng?: string;
 //       q?: string;
 //       page?: string;
 //       limit?: string;
@@ -816,47 +745,91 @@ export const searchFacilitiesWithReviews = async (
 //     const pageNum = parseInt(page);
 //     const limitNum = parseInt(limit);
 
-//     if (!q) return res.status(400).json({ message: "Missing search query" });
-
-//     const pageCacheKey = `facility:query:${q.toLowerCase()}&page:${pageNum}`;
-
 //     // -----------------------------
-//     // 0️⃣ Check if page is cached
+//     // Base cache keys
 //     // -----------------------------
+//     const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
+//     const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
+
+//     // ✅ Check cache first
 //     const cachedPage = await getCache(pageCacheKey);
 //     if (cachedPage) {
-//       const parsed = JSON.parse(cachedPage);
-//       return res.status(200).json({
-//         ...parsed,
-//         cached: true,
-//         from: "cache",
-//       });
+//       console.log(`✅ CACHE HIT for ${pageCacheKey}`);
+//       return res.status(200).json({ ...JSON.parse(cachedPage), cached: true, from: "cache" });
 //     }
 
 //     // -----------------------------
-//     // 1️⃣ Get data directly from DB (only current page)
+//     // Load from DB
 //     // -----------------------------
-//     const skip = (pageNum - 1) * limitNum;
+//     let facilities: any[] = [];
 
-//     const facilities = await Facility.find({
-//       name: { $regex: q, $options: "i" },
-//     })
-//       .skip(skip)
-//       .limit(limitNum)
-//       .lean();
+//     // 🗺️ Case 1: Lat/Lng search
+//     if (lat && lng) {
+//       const latitude = parseFloat(lat);
+//       const longitude = parseFloat(lng);
 
-//     const total = await Facility.countDocuments({
-//       name: { $regex: q, $options: "i" },
-//     });
+//       facilities = await Facility.find({
+//         geoLocation: {
+//           $near: {
+//             $geometry: { type: "Point", coordinates: [longitude, latitude] },
+//             $maxDistance: 50000, // 50 km radius
+//           },
+//         },
+//         state: { $in: allowedAbbr },
+//       })
+//         .skip((pageNum - 1) * limitNum)
+//         .limit(limitNum)
+//         .lean();
+//     }
+
+//     // 🏙️ Case 2: Text-based query (q)
+//     else if (q) {
+//       const { type, value } = normalizeQuery(q.trim());
+//       const mongoQuery: any = {};
+
+//       if (type === "zip") {
+//           const stateOfZip = await Facility.findOne({ zip_code: value }).select("state").lean();
+
+//           // Fix: safely extract the state value (could be null)
+//           const zipState = stateOfZip?.state ?? null;
+
+//           if (!zipState || !allowedAbbr.includes(zipState)) {
+//             return res.status(400).json({
+//               error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+//             });
+//           }
+
+//           mongoQuery.zip_code = value;
+
+//       } else if (type === "state") {
+//         if (!allowedAbbr.includes(value)) {
+//           return res.status(400).json({
+//             error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+//           });
+//         }
+//         mongoQuery.state = new RegExp(`^${value}$`, "i");
+//       } else {
+//         // For city search — restrict to allowed states
+//         mongoQuery.$and = [
+//           { $or: [{ city_town: new RegExp(value, "i") }, { name: new RegExp(value, "i") }] },
+//           { state: { $in: allowedAbbr } },
+//         ];
+//       }
+
+//       facilities = await Facility.find(mongoQuery)
+//         .skip((pageNum - 1) * limitNum)
+//         .limit(limitNum)
+//         .lean();
+//     }
+
+//     const total = facilities.length;
 
 //     // -----------------------------
-//     // 2️⃣ Google + AI enrichment
+//     // Google + AI enrichment
 //     // -----------------------------
-//     const googleResults = await Promise.all(
-//       facilities.map((f: FacilityType) => getGoogleDataFast(f))
-//     );
+//     const googleResults = await Promise.all(facilities.map((f) => getGoogleDataFast(f)));
 
-//     const reviewsTexts = facilities.map((_: FacilityType, i: number) =>
+//     const reviewsTexts = facilities.map((_: any, i: number) =>
 //       googleResults[i]?.reviews?.length
 //         ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
 //         : ""
@@ -864,7 +837,7 @@ export const searchFacilitiesWithReviews = async (
 
 //     const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
 
-//     const pagedResults = facilities.map((f: FacilityType, i: number) => {
+//     const pagedResults = facilities.map((f: any, i: number) => {
 //       const gd = googleResults[i] ?? {};
 //       return {
 //         ...f,
@@ -878,7 +851,7 @@ export const searchFacilitiesWithReviews = async (
 //     });
 
 //     // -----------------------------
-//     // 3️⃣ Cache this page for 1 year
+//     // Cache & Return
 //     // -----------------------------
 //     await setCache(
 //       pageCacheKey,
@@ -886,9 +859,6 @@ export const searchFacilitiesWithReviews = async (
 //       ONE_YEAR_MS
 //     );
 
-//     // -----------------------------
-//     // 4️⃣ Return results
-//     // -----------------------------
 //     return res.status(200).json({
 //       data: pagedResults,
 //       total,
@@ -903,6 +873,160 @@ export const searchFacilitiesWithReviews = async (
 //   }
 // };
 
+
+
+
+
+
+// ✅ Main Search Function
+export const searchFacilitiesWithReviews = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { lat, lng, q, page = "1", limit = "8" } = req.query as {
+      lat?: string;
+      lng?: string;
+      q?: string;
+      page?: string;
+      limit?: string;
+    };
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+
+    const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
+    const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
+
+    // -----------------------------
+    // 1️⃣ Try Redis cache
+    // -----------------------------
+    const cachedRedis = await getCache(pageCacheKey);
+    if (cachedRedis) {
+      console.log(`✅ Redis Cache HIT for ${pageCacheKey}`);
+      return res.status(200).json({ ...JSON.parse(cachedRedis), cached: true, from: "redis" });
+    }
+
+    // -----------------------------
+    // 2️⃣ Try Mongo Cache collection
+    // -----------------------------
+    const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
+    if (mongoCache) {
+      console.log(`✅ Mongo Cache HIT for ${pageCacheKey}`);
+      // Restore to Redis for faster next access
+      await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
+      return res
+        .status(200)
+        .json({ ...mongoCache.data, cached: true, from: "mongo-cache" });
+    }
+
+    // -----------------------------
+    // 3️⃣ Not found → Query Main DB
+    // -----------------------------
+    let facilities: any[] = [];
+
+    if (lat && lng) {
+      const latitude = parseFloat(lat);
+      const longitude = parseFloat(lng);
+
+      facilities = await Facility.find({
+        geoLocation: {
+          $near: {
+            $geometry: { type: "Point", coordinates: [longitude, latitude] },
+            $maxDistance: 50000,
+          },
+        },
+        state: { $in: allowedAbbr },
+      })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean();
+    } else if (q) {
+      const { type, value } = normalizeQuery(q.trim());
+      const mongoQuery: any = {};
+
+      if (type === "zip") {
+        const stateOfZip = await Facility.findOne({ zip_code: value }).select("state").lean();
+        const zipState = stateOfZip?.state ?? null;
+
+        if (!zipState || !allowedAbbr.includes(zipState)) {
+          return res.status(400).json({
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+          });
+        }
+        mongoQuery.zip_code = value;
+      } else if (type === "state") {
+        if (!allowedAbbr.includes(value)) {
+          return res.status(400).json({
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+          });
+        }
+        mongoQuery.state = new RegExp(`^${value}$`, "i");
+      } else {
+        mongoQuery.$and = [
+          { $or: [{ city_town: new RegExp(value, "i") }, { name: new RegExp(value, "i") }] },
+          { state: { $in: allowedAbbr } },
+        ];
+      }
+
+      facilities = await Facility.find(mongoQuery)
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean();
+    }
+
+    const total = facilities.length;
+
+    // -----------------------------
+    // 4️⃣ Google + AI enrichment
+    // -----------------------------
+    const googleResults = await Promise.all(facilities.map((f) => getGoogleDataFast(f)));
+    const reviewsTexts = facilities.map((_: any, i: number) =>
+      googleResults[i]?.reviews?.length
+        ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+        : ""
+    );
+    const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+    const pagedResults = facilities.map((f: any, i: number) => {
+      const gd = googleResults[i] ?? {};
+      return {
+        ...f,
+        googleName: gd.googleName ?? null,
+        rating: gd.rating ?? null,
+        photo: gd.photos?.[0] || null,
+        lat: gd.lat ?? null,
+        lng: gd.lng ?? null,
+        aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+      };
+    });
+
+    const responseData = {
+      data: pagedResults,
+      total,
+      page: pageNum,
+      limit: limitNum,
+      cached: false,
+      from: "db",
+    };
+
+    // -----------------------------
+    // 5️⃣ Store in Redis & Mongo Cache
+    // -----------------------------
+    await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
+    await CachedSearchResult.updateOne(
+      { key: pageCacheKey },
+      { $set: { data: responseData } },
+      { upsert: true }
+    );
+
+    return res.status(200).json(responseData);
+  } catch (err: any) {
+    console.error("❌ API error:", err);
+    res.status(500).json({ error: err.message });
+  }
+};
 
 
 

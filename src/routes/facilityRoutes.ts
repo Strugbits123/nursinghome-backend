@@ -11,15 +11,16 @@ import { Router, Request, Response, NextFunction } from "express";
 
 const router = Router();
 // Middleware to disable browser caching
-const noCacheMiddleware = (req: Request, res: Response, next: NextFunction) => {
-  res.set("Cache-Control", "no-store");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-  next();
-};
+// const noCacheMiddleware = (req: Request, res: Response, next: NextFunction) => {
+//   res.set("Cache-Control", "no-store");
+//   res.set("Pragma", "no-cache");
+//   res.set("Expires", "0");
+//   next();
+// };
 
 // Apply middleware to this route
-router.get("/with-reviews", noCacheMiddleware, searchFacilitiesWithReviews);
+// router.get("/with-reviews", noCacheMiddleware, searchFacilitiesWithReviews);
+router.get("/with-reviews", searchFacilitiesWithReviews);
 router.get('/details', getFacilityDetails); 
 router.get("/filter-with-reviews", filterFacilitiesWithReviews);
 
