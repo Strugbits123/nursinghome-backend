@@ -1125,7 +1125,6 @@ type FacilityType = any;
 
 
 
-
 export const searchFacilitiesWithReviews = async (
   req: Request,
   res: Response,
@@ -1212,49 +1211,56 @@ export const searchFacilitiesWithReviews = async (
         .limit(limitNum)
         .lean();
     } else if (q) {
-     
       // Text-based search
       const cleanedQuery = q.replace(/_/g, " ").trim();
       const { type, value } = normalizeQuery(cleanedQuery);
 
       if (type === "zip") {
-         const zipNumber = parseInt(value, 10);
-          if (isNaN(zipNumber)) {
-            return res.status(400).json({
-              error: `Invalid ZIP code "${value}".`,
-            });
-          }
-          
-          // Find facility with this ZIP
-          const facilityZip = await NursingFacility.findOne({ zip_code: zipNumber }).select("state").lean();
+        const zipNumber = parseInt(value, 10);
+        if (isNaN(zipNumber)) {
+          return res.status(400).json({ error: `Invalid ZIP code "${value}".` });
+        }
 
-          if (!facilityZip) {
-            return res.status(400).json({
-              error: `Sorry, ZIP code "${zipNumber}" is not found in our database.`,
-            });
-          }
+        // Total count for ZIP
+        total = await NursingFacility.countDocuments({ zip_code: zipNumber });
 
-          // Normalize state from DB to match allowedAbbr
-          const zipStateNormalized = facilityZip.state?.trim().toUpperCase() || null;
+        if (!total) {
+          return res.status(400).json({
+            error: `Sorry, ZIP code "${zipNumber}" is not found in our database.`,
+          });
+        }
 
-          if (!zipStateNormalized || !allowedAbbr.includes(zipStateNormalized)) {
-            return res.status(400).json({
-              error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
-            });
-          }
+        // Check if ZIP belongs to allowed states
+        const facilityZip = await NursingFacility.findOne({ zip_code: zipNumber })
+          .select("state")
+          .lean();
 
-          mongoQuery = { zip_code: zipNumber, state: zipStateNormalized };
+        const zipStateNormalized = facilityZip?.state?.trim().toUpperCase() || null;
+        if (!zipStateNormalized || !allowedAbbr.includes(zipStateNormalized)) {
+          return res.status(400).json({
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+          });
+        }
 
+        mongoQuery = { zip_code: zipNumber, state: zipStateNormalized };
+        facilities = await NursingFacility.find(mongoQuery)
+          .skip((pageNum - 1) * limitNum)
+          .limit(limitNum)
+          .lean();
       } else if (type === "state") {
         const abbr = stateToAbbr[value] || value.toUpperCase();
-
         if (!allowedAbbr.includes(abbr)) {
           return res.status(400).json({
-            error: `Sorry, we currently searches only for ${allowedStates.join(", ")}.`,
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
           });
         }
 
         mongoQuery = { state: abbr };
+        total = await NursingFacility.countDocuments(mongoQuery);
+        facilities = await NursingFacility.find(mongoQuery)
+          .skip((pageNum - 1) * limitNum)
+          .limit(limitNum)
+          .lean();
       } else if (type === "city") {
         // Check if city exists in allowed states
         const facilityInCity = await NursingFacility.findOne({ city_town: new RegExp(value, "i") })
@@ -1263,11 +1269,16 @@ export const searchFacilitiesWithReviews = async (
 
         if (!facilityInCity || !allowedAbbr.includes(facilityInCity.state ?? "")) {
           return res.status(400).json({
-            error: `Sorry, we currently searches only for ${allowedStates.join(", ")}.`,
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
           });
         }
 
         mongoQuery = { city_town: new RegExp(value, "i") };
+        total = await NursingFacility.countDocuments(mongoQuery);
+        facilities = await NursingFacility.find(mongoQuery)
+          .skip((pageNum - 1) * limitNum)
+          .limit(limitNum)
+          .lean();
       } else {
         mongoQuery = {
           $or: [
@@ -1277,14 +1288,13 @@ export const searchFacilitiesWithReviews = async (
           ],
           state: { $in: allowedAbbr },
         };
+
+        total = await NursingFacility.countDocuments(mongoQuery);
+        facilities = await NursingFacility.find(mongoQuery)
+          .skip((pageNum - 1) * limitNum)
+          .limit(limitNum)
+          .lean();
       }
-
-      total = await NursingFacility.countDocuments(mongoQuery);
-
-      facilities = await NursingFacility.find(mongoQuery)
-        .skip((pageNum - 1) * limitNum)
-        .limit(limitNum)
-        .lean();
     }
 
     // -----------------------------
@@ -1303,7 +1313,7 @@ export const searchFacilitiesWithReviews = async (
         from: "db",
       });
     }
-
+ 
     // -----------------------------
     // 5️⃣ Google + AI Enrichment
     // -----------------------------
@@ -1330,7 +1340,7 @@ export const searchFacilitiesWithReviews = async (
 
     const responseData = {
       data: pagedResults,
-      total,
+      total, // total reflects all matching facilities for ZIP / state / city
       page: pageNum,
       limit: limitNum,
       cached: false,
