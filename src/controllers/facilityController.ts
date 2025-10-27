@@ -2157,7 +2157,7 @@ export const filterFacilitiesWithReviews = async (
     }
 
     // 🔢 9️⃣ APPLY LIMIT (default 50)
-    const resultsLimit = limit ? parseInt(limit) : 50;
+    const resultsLimit = limit ? parseInt(limit) : 10;
     pipeline.push({ $limit: resultsLimit });
 
     // 🚀 EXECUTE QUERY (no limit)
