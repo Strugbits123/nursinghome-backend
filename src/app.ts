@@ -84,14 +84,6 @@ const connectDB = async () => {
        
     const PORT: number = Number(process.env.PORT) || 5000;
     app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
-    const count = await NursingFacility.countDocuments();
-    console.log("Facilities count in 'nursingfacilities':", count);
-
-    const sample = await NursingFacility.find().limit(3).lean();
-    console.log("Sample facilities:", sample);
-
-    
   } catch (err) {
     console.error('❌ MongoDB connection error:', err);
     process.exit(1);
