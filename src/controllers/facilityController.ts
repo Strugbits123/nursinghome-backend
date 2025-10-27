@@ -22,6 +22,7 @@ import CachedSearchResult from "../models/CachedSearchResult";
 
 const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000; // 1 year for core details
 const REVIEWS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // refresh reviews weekly
+const ONE_HOUR_MS = 60 * 60; // 1 hour in seconds
 
 const CMS_API_URL =
   "https://data.cms.gov/provider-data/api/1/datastore/query/4pq5-n9py/0";
@@ -522,18 +523,16 @@ export const getFacilityDetails = async (
 //   return { type: "city", value: q };
 // }
 
-
 // ✅ Allowed states
 const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
 const allowedAbbr = ["NY", "NJ", "CT", "PA"];
-
-// ✅ State to abbreviation map
 const stateToAbbr: Record<string, string> = {
-  "New York": "NY",
-  "New Jersey": "NJ",
-  "Connecticut": "CT",
-  "Pennsylvania": "PA",
+"New York": "NY",
+"New Jersey": "NJ",
+"Connecticut": "CT",
+"Pennsylvania": "PA",
 };
+
 
 // ✅ Detect ZIP / State / City
 function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
@@ -877,155 +876,212 @@ type FacilityType = any;
 
 
 
-
 // ✅ Main Search Function
 export const searchFacilitiesWithReviews = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
+req: Request,
+res: Response,
+next: NextFunction
 ) => {
-  try {
-    const { lat, lng, q, page = "1", limit = "8" } = req.query as {
-      lat?: string;
-      lng?: string;
-      q?: string;
-      page?: string;
-      limit?: string;
-    };
+try {
+const { lat, lng, q, page = "1", limit = "8" } = req.query as {
+lat?: string;
+lng?: string;
+q?: string;
+page?: string;
+limit?: string;
+};
 
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
+const pageNum = parseInt(page);
+const limitNum = parseInt(limit);
 
-    const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
-    const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
+const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
+const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
 
-    // -----------------------------
-    // 1️⃣ Try Redis cache
-    // -----------------------------
-    const cachedRedis = await getCache(pageCacheKey);
-    if (cachedRedis) {
-      console.log(`✅ Redis Cache HIT for ${pageCacheKey}`);
-      return res.status(200).json({ ...JSON.parse(cachedRedis), cached: true, from: "redis" });
+// -----------------------------
+// 1️⃣ Try Redis cache
+// -----------------------------
+const cachedRedis = await getCache(pageCacheKey);
+if (cachedRedis) {
+  console.log(`✅ Redis Cache HIT for ${pageCacheKey}`);
+  return res
+    .status(200)
+    .json({ ...JSON.parse(cachedRedis), cached: true, from: "redis" });
+}
+
+// -----------------------------
+// 2️⃣ Try Mongo Cache
+// -----------------------------
+const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
+if (mongoCache) {
+  console.log(`✅ Mongo Cache HIT for ${pageCacheKey}`);
+  await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
+  return res
+    .status(200)
+    .json({ ...mongoCache.data, cached: true, from: "mongo-cache" });
+}
+
+// -----------------------------
+// 3️⃣ Not found → Query Main DB
+// -----------------------------
+let facilities: any[] = [];
+
+if (lat && lng) {
+  const latitude = parseFloat(lat);
+  const longitude = parseFloat(lng);
+
+  facilities = await Facility.find({
+    geoLocation: {
+      $near: {
+        $geometry: { type: "Point", coordinates: [longitude, latitude] },
+        $maxDistance: 50000,
+      },
+    },
+    state: { $in: allowedAbbr },
+  })
+    .skip((pageNum - 1) * limitNum)
+    .limit(limitNum)
+    .lean();
+} else if (q) {
+  const queryValue = q.trim();
+  const { type, value } = normalizeQuery(queryValue);
+  const mongoQuery: any = {};
+
+  // -----------------------------
+  // 🚦 Validate State Queries
+  // -----------------------------
+  if (type === "state") {
+    // Try both full name and abbreviation
+    const upperValue = value.toUpperCase();
+    const normalizedState =
+      stateToAbbr[queryValue] || upperValue;
+
+    if (!allowedAbbr.includes(normalizedState)) {
+      return res.status(400).json({
+        error: `Sorry, we currently support searches only for: ${allowedStates.join(
+          ", "
+        )}.`,
+        unsupportedState: queryValue,
+      });
     }
 
-    // -----------------------------
-    // 2️⃣ Try Mongo Cache collection
-    // -----------------------------
-    const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
-    if (mongoCache) {
-      console.log(`✅ Mongo Cache HIT for ${pageCacheKey}`);
-      // Restore to Redis for faster next access
-      await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
-      return res
-        .status(200)
-        .json({ ...mongoCache.data, cached: true, from: "mongo-cache" });
-    }
-
-    // -----------------------------
-    // 3️⃣ Not found → Query Main DB
-    // -----------------------------
-    let facilities: any[] = [];
-
-    if (lat && lng) {
-      const latitude = parseFloat(lat);
-      const longitude = parseFloat(lng);
-
-      facilities = await Facility.find({
-        geoLocation: {
-          $near: {
-            $geometry: { type: "Point", coordinates: [longitude, latitude] },
-            $maxDistance: 50000,
-          },
-        },
-        state: { $in: allowedAbbr },
-      })
-        .skip((pageNum - 1) * limitNum)
-        .limit(limitNum)
-        .lean();
-    } else if (q) {
-      const { type, value } = normalizeQuery(q.trim());
-      const mongoQuery: any = {};
-
-      if (type === "zip") {
-        const stateOfZip = await Facility.findOne({ zip_code: value }).select("state").lean();
-        const zipState = stateOfZip?.state ?? null;
-
-        if (!zipState || !allowedAbbr.includes(zipState)) {
-          return res.status(400).json({
-            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
-          });
-        }
-        mongoQuery.zip_code = value;
-      } else if (type === "state") {
-        if (!allowedAbbr.includes(value)) {
-          return res.status(400).json({
-            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
-          });
-        }
-        mongoQuery.state = new RegExp(`^${value}$`, "i");
-      } else {
-        mongoQuery.$and = [
-          { $or: [{ city_town: new RegExp(value, "i") }, { name: new RegExp(value, "i") }] },
-          { state: { $in: allowedAbbr } },
-        ];
-      }
-
-      facilities = await Facility.find(mongoQuery)
-        .skip((pageNum - 1) * limitNum)
-        .limit(limitNum)
-        .lean();
-    }
-
-    const total = facilities.length;
-
-    // -----------------------------
-    // 4️⃣ Google + AI enrichment
-    // -----------------------------
-    const googleResults = await Promise.all(facilities.map((f) => getGoogleDataFast(f)));
-    const reviewsTexts = facilities.map((_: any, i: number) =>
-      googleResults[i]?.reviews?.length
-        ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
-        : ""
-    );
-    const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
-
-    const pagedResults = facilities.map((f: any, i: number) => {
-      const gd = googleResults[i] ?? {};
-      return {
-        ...f,
-        googleName: gd.googleName ?? null,
-        rating: gd.rating ?? null,
-        photo: gd.photos?.[0] || null,
-        lat: gd.lat ?? null,
-        lng: gd.lng ?? null,
-        aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
-      };
-    });
-
-    const responseData = {
-      data: pagedResults,
-      total,
-      page: pageNum,
-      limit: limitNum,
-      cached: false,
-      from: "db",
-    };
-
-    // -----------------------------
-    // 5️⃣ Store in Redis & Mongo Cache
-    // -----------------------------
-    await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
-    await CachedSearchResult.updateOne(
-      { key: pageCacheKey },
-      { $set: { data: responseData } },
-      { upsert: true }
-    );
-
-    return res.status(200).json(responseData);
-  } catch (err: any) {
-    console.error("❌ API error:", err);
-    res.status(500).json({ error: err.message });
+    mongoQuery.state = new RegExp(`^${normalizedState}$`, "i");
   }
+
+  // -----------------------------
+  // 🚦 Validate ZIP Code Queries
+  // -----------------------------
+  else if (type === "zip") {
+    const stateOfZip = await Facility.findOne({ zip_code: value })
+      .select("state")
+      .lean();
+    const zipState = stateOfZip?.state ?? null;
+
+    if (!zipState || !allowedAbbr.includes(zipState)) {
+      return res.status(400).json({
+        error: `Sorry, we currently support searches only for: ${allowedStates.join(
+          ", "
+        )}.`,
+      });
+    }
+    mongoQuery.zip_code = value;
+  }
+
+  // -----------------------------
+  // 🚦 City / Name Query (filter by allowed states)
+  // -----------------------------
+  else {
+    mongoQuery.$and = [
+      {
+        $or: [
+          { city_town: new RegExp(value, "i") },
+          { name: new RegExp(value, "i") },
+        ],
+      },
+      { state: { $in: allowedAbbr } },
+    ];
+  }
+
+  facilities = await Facility.find(mongoQuery)
+    .skip((pageNum - 1) * limitNum)
+    .limit(limitNum)
+    .lean();
+}
+
+const total = facilities.length;
+
+// -----------------------------
+// 4️⃣ No facilities found
+// -----------------------------
+if (!facilities.length) {
+  console.log(`⚠️ No facilities found for ${pageCacheKey}`);
+  const emptyResponse = {
+    data: [],
+    total: 0,
+    page: pageNum,
+    limit: limitNum,
+    cached: false,
+    from: "db",
+  };
+  await setCache(pageCacheKey, JSON.stringify(emptyResponse), ONE_HOUR_MS);
+  return res.status(200).json(emptyResponse);
+}
+
+// -----------------------------
+// 5️⃣ Google + AI enrichment
+// -----------------------------
+const googleResults = await Promise.all(
+  facilities.map((f) => getGoogleDataFast(f))
+);
+
+const reviewsTexts = facilities.map((_: any, i: number) =>
+  googleResults[i]?.reviews?.length
+    ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
+    : ""
+);
+
+const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
+
+const pagedResults = facilities.map((f: any, i: number) => {
+  const gd = googleResults[i] ?? {};
+  return {
+    ...f,
+    googleName: gd.googleName ?? null,
+    rating: gd.rating ?? null,
+    photo: gd.photos?.[0] || null,
+    lat: gd.lat ?? null,
+    lng: gd.lng ?? null,
+    aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
+  };
+});
+
+const responseData = {
+  data: pagedResults,
+  total,
+  page: pageNum,
+  limit: limitNum,
+  cached: false,
+  from: "db",
+};
+
+// -----------------------------
+// 6️⃣ Cache only if data exists
+// -----------------------------
+if (pagedResults.length > 0) {
+  await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
+  await CachedSearchResult.updateOne(
+    { key: pageCacheKey },
+    { $set: { data: responseData } },
+    { upsert: true }
+  );
+}
+
+return res.status(200).json(responseData);
+
+
+} catch (err: any) {
+console.error("❌ API error:", err);
+res.status(500).json({ error: err.message });
+}
 };
 
 
