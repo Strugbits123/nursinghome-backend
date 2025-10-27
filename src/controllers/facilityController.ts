@@ -524,14 +524,14 @@ export const getFacilityDetails = async (
 // }
 
 // ✅ Allowed states
-const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
-const allowedAbbr = ["NY", "NJ", "CT", "PA"];
-const stateToAbbr: Record<string, string> = {
-"New York": "NY",
-"New Jersey": "NJ",
-"Connecticut": "CT",
-"Pennsylvania": "PA",
-};
+// const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
+// const allowedAbbr = ["NY", "NJ", "CT", "PA"];
+// const stateToAbbr: Record<string, string> = {
+// "New York": "NY",
+// "New Jersey": "NJ",
+// "Connecticut": "CT",
+// "Pennsylvania": "PA",
+// };
 
 
 // ✅ Detect ZIP / State / City
@@ -894,11 +894,21 @@ limit?: string;
 const pageNum = parseInt(page);
 const limitNum = parseInt(limit);
 
+// ✅ Allowed states & abbreviations
+const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
+const allowedAbbr = ["NY", "NJ", "CT", "PA"];
+const stateToAbbr: Record<string, string> = {
+  "New York": "NY",
+  "New Jersey": "NJ",
+  "Connecticut": "CT",
+  "Pennsylvania": "PA",
+};
+
 const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
 const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
 
 // -----------------------------
-// 1️⃣ Try Redis cache
+// 1️⃣ Redis Cache
 // -----------------------------
 const cachedRedis = await getCache(pageCacheKey);
 if (cachedRedis) {
@@ -909,7 +919,7 @@ if (cachedRedis) {
 }
 
 // -----------------------------
-// 2️⃣ Try Mongo Cache
+// 2️⃣ Mongo Cache
 // -----------------------------
 const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
 if (mongoCache) {
@@ -921,13 +931,24 @@ if (mongoCache) {
 }
 
 // -----------------------------
-// 3️⃣ Not found → Query Main DB
+// 3️⃣ Query Main DB
 // -----------------------------
 let facilities: any[] = [];
+let totalFacilities = 0;
 
 if (lat && lng) {
   const latitude = parseFloat(lat);
   const longitude = parseFloat(lng);
+
+  totalFacilities = await Facility.countDocuments({
+    geoLocation: {
+      $near: {
+        $geometry: { type: "Point", coordinates: [longitude, latitude] },
+        $maxDistance: 50000,
+      },
+    },
+    state: { $in: allowedAbbr },
+  });
 
   facilities = await Facility.find({
     geoLocation: {
@@ -942,54 +963,44 @@ if (lat && lng) {
     .limit(limitNum)
     .lean();
 } else if (q) {
-  const queryValue = q.trim();
-  const { type, value } = normalizeQuery(queryValue);
+  const { type, value } = normalizeQuery(q.trim());
   const mongoQuery: any = {};
 
-  // -----------------------------
-  // 🚦 Validate State Queries
-  // -----------------------------
-  if (type === "state") {
-    // Try both full name and abbreviation
-    const upperValue = value.toUpperCase();
-    const normalizedState =
-      stateToAbbr[queryValue] || upperValue;
-
-    if (!allowedAbbr.includes(normalizedState)) {
-      return res.status(400).json({
-        error: `Sorry, we currently support searches only for: ${allowedStates.join(
-          ", "
-        )}.`,
-        unsupportedState: queryValue,
-      });
-    }
-
-    mongoQuery.state = new RegExp(`^${normalizedState}$`, "i");
-  }
-
-  // -----------------------------
-  // 🚦 Validate ZIP Code Queries
-  // -----------------------------
-  else if (type === "zip") {
-    const stateOfZip = await Facility.findOne({ zip_code: value })
-      .select("state")
-      .lean();
+  if (type === "zip") {
+    const stateOfZip = await Facility.findOne({ zip_code: value }).select("state").lean();
     const zipState = stateOfZip?.state ?? null;
 
     if (!zipState || !allowedAbbr.includes(zipState)) {
       return res.status(400).json({
-        error: `Sorry, we currently support searches only for: ${allowedStates.join(
-          ", "
-        )}.`,
+        error: `❌ Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
       });
     }
     mongoQuery.zip_code = value;
-  }
+  } else if (type === "state") {
+    // ✅ Block unsupported states early
+    const normalized = value.toUpperCase();
+    const validState =
+      allowedAbbr.includes(normalized) ||
+      Object.keys(stateToAbbr).some(
+        (st) => st.toLowerCase() === value.toLowerCase()
+      );
 
-  // -----------------------------
-  // 🚦 City / Name Query (filter by allowed states)
-  // -----------------------------
-  else {
+    if (!validState) {
+      return res.status(400).json({
+        error: `❌ Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+      });
+    }
+
+    // ✅ Support full name or abbreviation
+    if (allowedAbbr.includes(normalized)) {
+      mongoQuery.state = new RegExp(`^${normalized}$`, "i");
+    } else {
+      mongoQuery.state = new RegExp(
+        `^${stateToAbbr[value as keyof typeof stateToAbbr]}$`,
+        "i"
+      );
+    }
+  } else {
     mongoQuery.$and = [
       {
         $or: [
@@ -1001,39 +1012,19 @@ if (lat && lng) {
     ];
   }
 
+  totalFacilities = await Facility.countDocuments(mongoQuery);
+
   facilities = await Facility.find(mongoQuery)
     .skip((pageNum - 1) * limitNum)
     .limit(limitNum)
     .lean();
 }
 
-const total = facilities.length;
-
 // -----------------------------
-// 4️⃣ No facilities found
+// 4️⃣ Google + AI Enrichment
 // -----------------------------
-if (!facilities.length) {
-  console.log(`⚠️ No facilities found for ${pageCacheKey}`);
-  const emptyResponse = {
-    data: [],
-    total: 0,
-    page: pageNum,
-    limit: limitNum,
-    cached: false,
-    from: "db",
-  };
-  await setCache(pageCacheKey, JSON.stringify(emptyResponse), ONE_HOUR_MS);
-  return res.status(200).json(emptyResponse);
-}
-
-// -----------------------------
-// 5️⃣ Google + AI enrichment
-// -----------------------------
-const googleResults = await Promise.all(
-  facilities.map((f) => getGoogleDataFast(f))
-);
-
-const reviewsTexts = facilities.map((_: any, i: number) =>
+const googleResults = await Promise.all(facilities.map((f) => getGoogleDataFast(f)));
+const reviewsTexts = facilities.map((_, i) =>
   googleResults[i]?.reviews?.length
     ? googleResults[i].reviews.map((r: any) => r.text).join("\n")
     : ""
@@ -1041,7 +1032,7 @@ const reviewsTexts = facilities.map((_: any, i: number) =>
 
 const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
 
-const pagedResults = facilities.map((f: any, i: number) => {
+const pagedResults = facilities.map((f, i) => {
   const gd = googleResults[i] ?? {};
   return {
     ...f,
@@ -1054,26 +1045,27 @@ const pagedResults = facilities.map((f: any, i: number) => {
   };
 });
 
+// -----------------------------
+// 5️⃣ Response
+// -----------------------------
 const responseData = {
   data: pagedResults,
-  total,
+  total: totalFacilities,
   page: pageNum,
   limit: limitNum,
   cached: false,
-  from: "db",
+  from: pageNum <= 6 ? "db" : "db+google+ai",
 };
 
 // -----------------------------
-// 6️⃣ Cache only if data exists
+// 6️⃣ Store in Cache
 // -----------------------------
-if (pagedResults.length > 0) {
-  await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
-  await CachedSearchResult.updateOne(
-    { key: pageCacheKey },
-    { $set: { data: responseData } },
-    { upsert: true }
-  );
-}
+await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
+await CachedSearchResult.updateOne(
+  { key: pageCacheKey },
+  { $set: { data: responseData } },
+  { upsert: true }
+);
 
 return res.status(200).json(responseData);
 
@@ -1083,7 +1075,6 @@ console.error("❌ API error:", err);
 res.status(500).json({ error: err.message });
 }
 };
-
 
 
 
