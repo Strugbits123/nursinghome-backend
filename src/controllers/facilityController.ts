@@ -939,7 +939,7 @@ export const searchFacilitiesWithReviews = async (
     const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
 
     // -----------------------------
-    // 1️⃣ Try Redis Cache
+    // 1️⃣ Redis Cache
     // -----------------------------
     const cachedRedis = await getCache(pageCacheKey);
     if (cachedRedis) {
@@ -954,7 +954,7 @@ export const searchFacilitiesWithReviews = async (
     }
 
     // -----------------------------
-    // 2️⃣ Try Mongo Cache Collection
+    // 2️⃣ Mongo Cache Collection
     // -----------------------------
     const mongoCache = await CachedSearchResult.findOne({ key: pageCacheKey });
     if (mongoCache) {
@@ -973,29 +973,35 @@ export const searchFacilitiesWithReviews = async (
     // -----------------------------
     // 3️⃣ Query Main Database
     // -----------------------------
+    let mongoQuery: any = {};
     let facilities: any[] = [];
+    let total = 0;
 
     if (lat && lng) {
+      // ✅ Geo-based search
       const latitude = parseFloat(lat);
       const longitude = parseFloat(lng);
 
-      facilities = await NursingFacility.find({
+      mongoQuery = {
         geoLocation: {
           $near: {
             $geometry: { type: "Point", coordinates: [longitude, latitude] },
-            $maxDistance: 50000,
+            $maxDistance: 50000, // 50km
           },
         },
         state: { $in: allowedAbbr },
-      })
+      };
+
+      total = await NursingFacility.countDocuments(mongoQuery);
+
+      facilities = await NursingFacility.find(mongoQuery)
         .skip((pageNum - 1) * limitNum)
         .limit(limitNum)
         .lean();
     } else if (q) {
-      // ✅ Normalize underscores & spaces
+      // ✅ Text-based search
       const cleanedQuery = q.replace(/_/g, " ").trim();
       const { type, value } = normalizeQuery(cleanedQuery);
-      const mongoQuery: any = {};
 
       if (type === "zip") {
         const stateOfZip = await NursingFacility.findOne({ zip_code: value })
@@ -1005,40 +1011,41 @@ export const searchFacilitiesWithReviews = async (
 
         if (!zipState || !allowedAbbr.includes(zipState)) {
           return res.status(400).json({
-            error: `Sorry, we currently support searches only for ${allowedStates.join(
-              ", "
-            )}.`,
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
           });
         }
 
-        mongoQuery.zip_code = value;
+        mongoQuery = { zip_code: value };
       } else if (type === "state") {
-        // ✅ Convert full name → abbreviation (and check both)
         const abbr = stateToAbbr[value] || value.toUpperCase();
 
         if (!allowedAbbr.includes(abbr)) {
           return res.status(400).json({
-            error: `Sorry, we currently support searches only for ${allowedStates.join(
-              ", "
-            )}.`,
+            error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
           });
         }
 
-        mongoQuery.$or = [
-          { state: new RegExp(`^${abbr}$`, "i") },
-          { state: new RegExp(`^${value}$`, "i") },
-        ];
+        mongoQuery = {
+          $or: [
+            { state: new RegExp(`^${abbr}$`, "i") },
+            { state: new RegExp(`^${value}$`, "i") },
+          ],
+        };
       } else {
-        mongoQuery.$and = [
-          {
-            $or: [
-              { city_town: new RegExp(value, "i") },
-              { name: new RegExp(value, "i") },
-            ],
-          },
-          { state: { $in: allowedAbbr } },
-        ];
+        mongoQuery = {
+          $and: [
+            {
+              $or: [
+                { city_town: new RegExp(value, "i") },
+                { name: new RegExp(value, "i") },
+              ],
+            },
+            { state: { $in: allowedAbbr } },
+          ],
+        };
       }
+
+      total = await NursingFacility.countDocuments(mongoQuery);
 
       facilities = await NursingFacility.find(mongoQuery)
         .skip((pageNum - 1) * limitNum)
@@ -1046,13 +1053,11 @@ export const searchFacilitiesWithReviews = async (
         .lean();
     }
 
-    const totalFacilities = facilities.length;
-
     // -----------------------------
     // 4️⃣ Empty Result Handling
     // -----------------------------
-    if (totalFacilities === 0) {
-      console.log(`⚠️ No facilities found — removing any stale cache`);
+    if (facilities.length === 0) {
+      console.log(`⚠️ No facilities found — removing stale cache`);
       await deleteCache(pageCacheKey);
       await CachedSearchResult.deleteOne({ key: pageCacheKey });
 
@@ -1092,7 +1097,7 @@ export const searchFacilitiesWithReviews = async (
 
     const responseData = {
       data: pagedResults,
-      total: totalFacilities,
+      total,
       page: pageNum,
       limit: limitNum,
       cached: false,
@@ -1100,7 +1105,7 @@ export const searchFacilitiesWithReviews = async (
     };
 
     // -----------------------------
-    // 6️⃣ Cache Only Non-Empty Results
+    // 6️⃣ Cache Non-Empty Results
     // -----------------------------
     if (responseData.data.length > 0) {
       await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
