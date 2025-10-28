@@ -3,6 +3,7 @@ import axios, { AxiosError } from "axios";
 import axiosRetry from "axios-retry";
 import { getCache, setCache } from "../config/redisClient";
 
+// --- Configuration and Constants ---
 const BASE_URL = "https://maps.googleapis.com/maps/api";
 const TIMEOUT_MS = 10000; // 10s timeout
 const MAX_RETRIES = 3;

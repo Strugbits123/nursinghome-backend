@@ -1193,7 +1193,6 @@ export const searchFacilitiesWithReviews = async (
       // Geo-based search
       const latitude = parseFloat(lat);
       const longitude = parseFloat(lng);
-
       mongoQuery = {
         geoLocation: {
           $near: {
@@ -1216,24 +1215,20 @@ export const searchFacilitiesWithReviews = async (
       const { type, value } = normalizeQuery(cleanedQuery);
 
       if (type === "zip") {
-        const zipNumber = parseInt(value, 10);
-        if (isNaN(zipNumber)) {
-          return res.status(400).json({ error: `Invalid ZIP code "${value}".` });
-        }
+          const zipNumber = parseInt(value, 10);
+      if (isNaN(zipNumber)) {
+        return res.status(400).json({ error: `Invalid ZIP code "${value}".` });
+      }
 
-        // Total count for ZIP
-        total = await NursingFacility.countDocuments({ zip_code: zipNumber });
+      const normalizedZip = zipNumber.toString().padStart(5, "0");
+      console.log("normalizedZip ZIP :", normalizedZip);
 
-        if (!total) {
-          return res.status(400).json({
-            error: `Sorry, ZIP code "${zipNumber}" is not found in our database.`,
-          });
-        }
-
-        // Check if ZIP belongs to allowed states
-        const facilityZip = await NursingFacility.findOne({ zip_code: zipNumber })
-          .select("state")
-          .lean();
+      let total = await NursingFacility.countDocuments({ zip_code: normalizedZip });
+      console.log("Initial ZIP count:", total);
+      // Case 1: ZIP found in DB
+      if (total > 0) {
+        const facilityZip = await NursingFacility.findOne({ zip_code: normalizedZip }).select("state").lean();
+        console.log("Facility ZIP state:", facilityZip?.state);
 
         const zipStateNormalized = facilityZip?.state?.trim().toUpperCase() || null;
         if (!zipStateNormalized || !allowedAbbr.includes(zipStateNormalized)) {
@@ -1242,11 +1237,123 @@ export const searchFacilitiesWithReviews = async (
           });
         }
 
-        mongoQuery = { zip_code: zipNumber, state: zipStateNormalized };
-        facilities = await NursingFacility.find(mongoQuery)
+        const mongoQuery = { zip_code: normalizedZip, state: zipStateNormalized };
+        const facilities = await NursingFacility.find(mongoQuery)
           .skip((pageNum - 1) * limitNum)
           .limit(limitNum)
           .lean();
+
+        total = await NursingFacility.countDocuments(mongoQuery);
+
+        return res.json({
+          total,
+          facilities,
+          message: `Found ${total} facility(s) for ZIP "${normalizedZip}".`,
+        });
+      }
+
+      // Case 2: ZIP not in DB -> Get coords from Google and find nearby
+      try {
+      
+        const placeName = `${normalizedZip}, USA`;
+        const { lat, lng } = await getCoordinatesByPlaceName(placeName);
+        console.log("Google Coordinates:", { lng, lat });
+        console.log('allowed staedes', allowedAbbr);
+        const nearbyFacilities = await NursingFacility.find({
+          geoLocation: {
+            $near: {
+              $geometry: { type: "Point", coordinates: [lng, lat] },
+              $maxDistance: 50000, // 50 km radius
+            },
+          },
+          state: { $in: allowedAbbr },
+        })
+          .limit(limitNum)
+          .lean();
+          
+        console.log("Found:", nearbyFacilities.length);
+
+        return res.json({
+          message: `ZIP code "${normalizedZip}" not Found.`,
+          coordinates: { lat, lng },
+          total: nearbyFacilities.length,
+          facilities: nearbyFacilities,
+        });
+      } catch (err: any) {
+        console.error("Google Geocode Error:", err.message);
+        return res.status(400).json({
+          error: `ZIP code "${normalizedZip}" not found in our database and Google lookup failed: ${err.message}`,
+        });
+      }
+
+
+        //   let zipNumber = parseInt(value, 10);
+        // if (isNaN(zipNumber)) {
+        //   return res.status(400).json({ error: `Invalid ZIP code "${value}".` });
+        // }
+
+        // const normalizedZip = zipNumber.toString().padStart(5, "0");
+
+        // total = await NursingFacility.countDocuments({ zip_code: normalizedZip });
+
+        // if (!total) {
+        //   try {
+        //     const placeName = `${normalizedZip}, USA`;
+        //     const { lat, lng } = await getCoordinatesByPlaceName(placeName);
+
+        //     const nearbyFacilities = await NursingFacility.find({
+        //       geoLocation: {
+        //         $near: {
+        //           $geometry: { type: "Point", coordinates: [lng, lat] },
+        //           $maxDistance: 50000,
+        //         },
+        //       },
+        //       state: { $in: allowedAbbr },
+        //     })
+        //       .limit(limitNum)
+        //       .lean();
+
+        //     return res.json({
+        //       message: `ZIP code "${normalizedZip}" not found in our database. Showing nearby facilities based on Google coordinates.`,
+        //       coordinates: { lat, lng },
+        //       total: nearbyFacilities.length,
+        //       facilities: nearbyFacilities,
+        //     });
+        //   } catch (err: any) {
+        //     return res.status(400).json({
+        //       error: `ZIP code "${normalizedZip}" not found in our database and Google lookup failed: ${err.message}`,
+        //     });
+        //   }
+        // }
+
+        // // ZIP exists in DB
+        // const facilityZip = await NursingFacility.findOne({ zip_code: normalizedZip })
+        //   .select("state")
+        //   .lean();
+
+        // const zipStateNormalized = facilityZip?.state?.trim().toUpperCase() || null;
+        // if (!zipStateNormalized || !allowedAbbr.includes(zipStateNormalized)) {
+        //   return res.status(400).json({
+        //     error: `Sorry, we currently support searches only for ${allowedStates.join(", ")}.`,
+        //   });
+        // }
+
+        // mongoQuery = { zip_code: normalizedZip, state: zipStateNormalized };
+        // facilities = await NursingFacility.find(mongoQuery)
+        //   .skip((pageNum - 1) * limitNum)
+        //   .limit(limitNum)
+        //   .lean();
+
+        // total = await NursingFacility.countDocuments(mongoQuery);
+
+        // return res.json({
+        //   total,
+        //   facilities,
+        //   message: `Found ${total} facility(s) for ZIP "${normalizedZip}".`,
+        // });
+      
+
+        
       } else if (type === "state") {
         const abbr = stateToAbbr[value] || value.toUpperCase();
         if (!allowedAbbr.includes(abbr)) {
