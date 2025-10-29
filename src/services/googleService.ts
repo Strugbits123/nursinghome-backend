@@ -284,10 +284,31 @@ export async function getPlaceDetails(
  * @param photoRef The photo reference string.
  * @returns The full photo URL or null.
  */
-export function getPhotoUrl(photoRef?: string): string | null {
+// export function getPhotoUrl(photoRef?: string): string | null {
+//   if (!photoRef) return null;
+//   return `${BASE_URL}/place/photo?maxwidth=${PHOTO_MAX_WIDTH}&photoreference=${photoRef}&key=${apiKey}`;
+// }
+
+
+/**
+ * Constructs the URL for a place photo.
+ * @param photoRef The current, non-expired photo reference string.
+ * @param maxWidth The maximum requested width (in pixels).
+ * @returns The full photo URL or null.
+ */
+export function getPhotoUrl(photoRef?: string, maxWidth: number = 600): string | null {
   if (!photoRef) return null;
-  return `${BASE_URL}/place/photo?maxwidth=${PHOTO_MAX_WIDTH}&photoreference=${photoRef}&key=${apiKey}`;
+
+  // Google's max width for photos is 1600px
+  const validatedWidth = Math.min(maxWidth, 1600);
+
+  // Encode the photo reference just to be safe, although often not needed
+  const encodedPhotoRef = encodeURIComponent(photoRef); 
+
+  // Use the actual BASE_URL and apiKey variables from your environment
+  return `${BASE_URL}/place/photo?maxwidth=${validatedWidth}&photoreference=${encodedPhotoRef}&key=${apiKey}`;
 }
+
 
 /**
  * Gets coordinates (lat/lng) for a place name using the Geocoding API with caching.
