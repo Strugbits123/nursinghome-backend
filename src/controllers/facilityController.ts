@@ -410,6 +410,87 @@ export const getFacilityDetails = async (
 };
 
 
+// ✅ Get Top 10 Highest Rated Nursing Facilities (for Home Page)
+// ✅ Fetch and store Google data (no AI)
+export const getTop10Facilities = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const cacheKey = "top10:facilities";
+
+    // 1️⃣ Try Redis cache
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) {
+      return res
+        .status(200)
+        .json({ data: JSON.parse(cachedData), cached: true, from: "redis" });
+    }
+
+    // 2️⃣ Fetch top 10 facilities by rating from allowed states
+    const facilities = await NursingFacility.find({
+      state: { $in: ["NY", "NJ", "CT", "PA"] },
+    })
+      .sort({ rating: -1 })
+      .limit(10)
+      .lean();
+
+    if (!facilities.length) {
+      return res.status(200).json({ data: [], message: "No facilities found" });
+    }
+
+    // 3️⃣ Fetch Google data (photo, rating, coordinates)
+    const enrichedFacilities = await Promise.all(
+      facilities.map(async (f) => {
+        try {
+          const gd = await getGoogleDataFast(f);
+
+          // ✅ Save Google data in your DB if photo exists
+          if (gd?.photos?.[0]) {
+            await NursingFacility.updateOne(
+              { _id: f._id },
+              {
+                $set: {
+                  googleName: gd.googleName || f.provider_name,
+                  googlePhoto: gd.photos?.[0],
+                  googleRating: gd.rating || f.rating,
+                  googleLat: gd.lat,
+                  googleLng: gd.lng,
+                },
+              }
+            );
+          }
+
+          return {
+            ...f,
+            googleName: gd.googleName ?? f.provider_name,
+            rating: gd.rating ?? f.rating ?? null,
+            photo: gd.photos?.[0] || null,
+            lat: gd.lat ?? null,
+            lng: gd.lng ?? null,
+          };
+        } catch (err: any) {
+          console.error(`Google fetch failed for ${f.provider_name}:`, err.message);
+          return f; // fallback to original
+        }
+      })
+    );
+
+    // 4️⃣ Cache for 24 hours
+    await setCache(cacheKey, JSON.stringify(enrichedFacilities), 86400 * 1000);
+
+    return res.status(200).json({
+      data: enrichedFacilities,
+      total: enrichedFacilities.length,
+      from: "db",
+    });
+  } catch (err: any) {
+    console.error("❌ getTop10Facilities Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
 
 
 
