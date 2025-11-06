@@ -2,12 +2,17 @@
 import axios, { AxiosError } from "axios";
 import axiosRetry from "axios-retry";
 import { getCache, setCache } from "../config/redisClient";
+import fs from 'fs/promises';
+import path from 'path';
 
 // --- Configuration and Constants ---
 const BASE_URL = "https://maps.googleapis.com/maps/api";
 const TIMEOUT_MS = 10000; // 10s timeout
 const MAX_RETRIES = 3;
 const PHOTO_MAX_WIDTH = 600;
+
+const IMAGE_CACHE_DIR = path.join(process.cwd(), 'public', 'cached-photos');
+const CACHE_DURATION_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
 
 // Cache TTL constants (in seconds)
 const CACHE_TTL = {
@@ -146,6 +151,8 @@ async function setCachedData<T>(key: string, data: T, ttl: number): Promise<void
     console.warn(`Cache write error for key ${key}:`, error);
   }
 }
+
+
 
 /**
  * Finds a Place ID by text query using the Text Search API with caching.
