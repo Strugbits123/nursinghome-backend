@@ -505,6 +505,116 @@ async function getGoogleDataFast(facility: any) {
 
 
 
+// // Get Facility Details
+// export const getFacilityDetails = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction
+// ) => {
+//   try {
+//     const { name } = req.query as { name?: string };
+
+//     if (!name) {
+//       return res.status(400).json({ message: "Facility name is required." });
+//     }
+
+//     const safeName = name.trim();
+//     const firstWord = safeName.split(/\s+/)[0];
+//     const escapedFirstWord = firstWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+//     const escapedFull = safeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+//     // Try anchored match on both full name and first word
+//     let facility = await Facility.findOne({
+//       $or: [
+//         { provider_name: { $regex: `^${escapedFull}`, $options: "i" } },
+//         { legal_business_name: { $regex: `^${escapedFull}`, $options: "i" } },
+//         { provider_name: { $regex: `^${escapedFirstWord}`, $options: "i" } },
+//         { legal_business_name: { $regex: `^${escapedFirstWord}`, $options: "i" } },
+//       ],
+//     })
+//       .sort({ provider_name: 1 })
+//       .lean();
+
+//     if (!facility) {
+//       // Fallback 1: Trimmed field match using $expr to handle stray spaces
+//       const exprRegex = new RegExp(`^${escapedFirstWord}`, "i");
+//       const trimmed = await Facility.findOne({
+//         $or: [
+//           { $expr: { $regexMatch: { input: { $trim: { input: "$provider_name" } }, regex: exprRegex } } },
+//           { $expr: { $regexMatch: { input: { $trim: { input: "$legal_business_name" } }, regex: exprRegex } } },
+//         ],
+//       })
+//         .sort({ provider_name: 1 })
+//         .lean();
+
+//       if (trimmed) {
+//         facility = trimmed;
+//       } else {
+//         // Fallback 2: contains search to help catch slight variations
+//         const fallback = await Facility.findOne({
+//           $or: [
+//             { provider_name: { $regex: `${escapedFirstWord}`, $options: "i" } },
+//             { legal_business_name: { $regex: `${escapedFirstWord}`, $options: "i" } },
+//           ],
+//         })
+//           .sort({ provider_name: 1 })
+//           .lean();
+
+//         if (!fallback) {
+//           console.log(`[DETAIL DEBUG] No facilities found for name='${safeName}' (full/first-word, anchored; trimmed; contains).`);
+//           return res.status(404).json({ message: "Facility not found." });
+//         }
+
+//         facility = fallback;
+//       }
+//     }
+
+//     // ✅ Fetch Google data safely
+//     const googleData = (await fetchAndCacheGoogleData(facility)) ?? {
+//       googleName: null,
+//       rating: null,
+//       lat: null,
+//       lng: null,
+//       photos: [],
+//       reviews: [],
+//       user_ratings_total: null, // Add this default
+//     };
+
+//     // ✅ Safe default AI summary
+//     let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] };
+
+//     // ✅ Safely extract review text (no TS18047)
+//     const reviewsText = googleData.reviews?.length
+//       ? googleData.reviews.map((r: any) => r.text).join("\n")
+//       : "";
+
+//     // ✅ Only summarize if reviews exist
+//     if (reviewsText) {
+//       try {
+//         aiSummary = await summarizeReviews(reviewsText);
+//       } catch (err) {
+//         console.error("⚠️ AI Summary failed:", err);
+//       }
+//     }
+
+//     // ✅ Respond with combined facility + Google data
+//     res.json({
+//       ...facility,
+//       googleName: googleData.googleName ?? null,
+//       rating: googleData.rating ?? null,
+//       photos: googleData.photos ?? [],
+//       reviews: googleData.reviews ?? [],
+//       lat: googleData.lat ?? null,
+//       lng: googleData.lng ?? null,
+//       user_ratings_total: googleData.user_ratings_total ?? null,
+//       aiSummary,
+//     });
+//   } catch (err) {
+//     console.error("❌ Error in getFacilityDetails:", err);
+//     next(err);
+//   }
+// };
+
 // Get Facility Details
 export const getFacilityDetails = async (
   req: Request,
@@ -577,8 +687,17 @@ export const getFacilityDetails = async (
       lng: null,
       photos: [],
       reviews: [],
-      user_ratings_total: null, // Add this default
+      user_ratings_total: null,
     };
+
+    // ✅ DEBUG: Log what we're getting from Google
+    console.log('🔍 Google Data Debug:', {
+      hasUserRatingsTotal: 'user_ratings_total' in googleData,
+      user_ratings_total: googleData.user_ratings_total,
+      rating: googleData.rating,
+      reviewsCount: googleData.reviews?.length,
+      photosCount: googleData.photos?.length
+    });
 
     // ✅ Safe default AI summary
     let aiSummary: SummarizeResult = { summary: "", pros: [], cons: [] };
@@ -598,7 +717,7 @@ export const getFacilityDetails = async (
     }
 
     // ✅ Respond with combined facility + Google data
-    res.json({
+    const responseData = {
       ...facility,
       googleName: googleData.googleName ?? null,
       rating: googleData.rating ?? null,
@@ -608,13 +727,20 @@ export const getFacilityDetails = async (
       lng: googleData.lng ?? null,
       user_ratings_total: googleData.user_ratings_total ?? null,
       aiSummary,
+    };
+
+    // ✅ DEBUG: Log final response
+    console.log('🔍 Final Response Debug:', {
+      hasUserRatingsTotal: 'user_ratings_total' in responseData,
+      user_ratings_total: responseData.user_ratings_total
     });
+
+    res.json(responseData);
   } catch (err) {
     console.error("❌ Error in getFacilityDetails:", err);
     next(err);
   }
 };
-
 
 // ✅ Get Top 10 Highest Rated Nursing Facilities (for Home Page)
 // ✅ Fetch and store Google data (no AI)
