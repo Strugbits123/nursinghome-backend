@@ -147,9 +147,9 @@ async function downloadAndCachePhoto(
   facilityId?: string,
   googlePlaceId?: string
 ): Promise<string | null> {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY;
+  const apiKey = process.env.GOOGLE_API_KEY || process.env.GOOGLE_API_KEY;
   if (!apiKey) {
-    console.error('GOOGLE_MAPS_API_KEY or GOOGLE_API_KEY is required for photo download');
+    console.error('GOOGLE_API_KEY is required for photo download');
     return null;
   }
 

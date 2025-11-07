@@ -5,7 +5,10 @@ import {
   searchFacilitiesWithReviews,
   getFacilityDetails,
   filterFacilitiesWithReviews,
-  getTop10Facilities
+  getTop10Facilities,
+  refreshFacilityGoogleData,
+  batchRefreshGoogleData,
+   testGooglePlacesApi
 } from "../controllers/facilityController";
 import { protect } from "../middleware/authMiddleware";
 import { Router, Request, Response, NextFunction } from "express";
@@ -16,6 +19,12 @@ router.get("/with-reviews", searchFacilitiesWithReviews);
 router.get('/details', getFacilityDetails); 
 router.get("/filter-with-reviews", filterFacilitiesWithReviews);
 router.get("/top-10", getTop10Facilities);
+
+
+router.get('/:facilityId/refresh-google', refreshFacilityGoogleData);
+router.get('/refresh-google-batch', batchRefreshGoogleData);
+router.get('/test-google-places', testGooglePlacesApi);
+
 
 // Public route
 router.get("/search", searchFacilities);

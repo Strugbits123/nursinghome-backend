@@ -34,7 +34,7 @@ if (!apiKey) {
   console.warn("GOOGLE_API_KEY is missing. API calls will likely fail.");
 }
 
-const PLACE_DETAILS_FIELDS = "name,geometry,photos,rating,reviews";
+const PLACE_DETAILS_FIELDS = "name,geometry,photos,rating,reviews,user_ratings_total,place_id";
 
 // Rate limiting state
 let requestQueue: Array<() => Promise<any>> = [];
@@ -73,17 +73,21 @@ export interface PlaceDetails {
   name: string;
   lat: number | null;
   lng: number | null;
-  photos: PlacePhoto[];
-  reviews: PlaceReview[];
+  photos: any[];
+  reviews: any[];
   rating: number | null;
+  placeId?: string; // Optional if you want to add it
+  user_ratings_total?: number | null; 
+
 }
 
 interface PlaceCoreDetails {
   name: string;
   lat: number | null;
   lng: number | null;
-  photos: PlacePhoto[]; // we will store full objects but consume top 4
+  photos: PlacePhoto[];
   rating: number | null;
+  user_ratings_total?: number | null; // Change from just 'number' to 'number | null'
 }
 
 
@@ -206,9 +210,90 @@ export async function findPlaceIdByText(query: string): Promise<string | null> {
  * @param placeId The ID of the place.
  * @returns PlaceDetails object or null.
  */
+// export async function getPlaceDetails(
+//   placeId: string
+// ): Promise<PlaceDetails | null> {
+//   checkApiKey();
+  
+//   const coreKey = getCacheKey("place_core", placeId);
+//   const reviewsKey = getCacheKey("place_reviews", placeId);
+  
+//   // Try to read both caches
+//   const [cachedCore, cachedReviews] = await Promise.all([
+//     getCachedData<PlaceCoreDetails>(coreKey),
+//     getCachedData<PlaceReview[]>(reviewsKey),
+//   ]);
+  
+//   if (cachedCore && cachedReviews) {
+//     // Return assembled result, limiting to 4 photos
+//     return {
+//       name: cachedCore.name,
+//       lat: cachedCore.lat,
+//       lng: cachedCore.lng,
+//       photos: (cachedCore.photos || []).slice(0, 4),
+//       reviews: cachedReviews,
+//       rating: cachedCore.rating ?? null,
+//     };
+//   }
+
+//   try {
+//     const response = await rateLimitedRequest(async () => {
+//       return await googleAxios.get("/place/details/json", {
+//         params: {
+//           place_id: placeId,
+//           fields: PLACE_DETAILS_FIELDS,
+//           key: apiKey,
+//         },
+//       });
+//     });
+
+//     const data = response.data;
+//     if (data.status !== "OK" || !data.result) {
+//       if (data.status !== "OK") {
+//         console.warn(
+//           `getPlaceDetails API status not OK: ${data.status}. Place ID: ${placeId}`
+//         );
+//       }
+//       return null;
+//     }
+
+//     const result = data.result;
+//     const core: PlaceCoreDetails = {
+//       name: result.name || "",
+//       lat: result.geometry?.location?.lat ?? null,
+//       lng: result.geometry?.location?.lng ?? null,
+//       photos: result.photos || [],
+//       rating: result.rating ?? null,
+//     };
+//     const reviews: PlaceReview[] = result.reviews || [];
+
+//     // Update caches with separate TTLs. Only refresh core if missing
+//     const writes: Promise<void>[] = [];
+//     if (!cachedCore) {
+//       writes.push(setCachedData(coreKey, core, CACHE_TTL.PLACE_CORE));
+//     }
+//     // Always refresh reviews when we called Google
+//     writes.push(setCachedData(reviewsKey, reviews, CACHE_TTL.PLACE_REVIEWS));
+//     await Promise.all(writes);
+
+//     return {
+//       name: core.name,
+//       lat: core.lat,
+//       lng: core.lng,
+//       photos: (core.photos || []).slice(0, 4),
+//       reviews,
+//       rating: core.rating ?? null,
+//     };
+//   } catch (err: any) {
+//     console.error("getPlaceDetails error:", err.message || err);
+//     return null;
+//   }
+// }
+
+// Or update your getPlaceDetails function to return placeId:
 export async function getPlaceDetails(
   placeId: string
-): Promise<PlaceDetails | null> {
+): Promise<PlaceDetails & { placeId: string } | null> {
   checkApiKey();
   
   const coreKey = getCacheKey("place_core", placeId);
@@ -229,6 +314,8 @@ export async function getPlaceDetails(
       photos: (cachedCore.photos || []).slice(0, 4),
       reviews: cachedReviews,
       rating: cachedCore.rating ?? null,
+      placeId: placeId,
+      user_ratings_total: cachedCore.user_ratings_total ?? null, // This will now work
     };
   }
 
@@ -260,6 +347,7 @@ export async function getPlaceDetails(
       lng: result.geometry?.location?.lng ?? null,
       photos: result.photos || [],
       rating: result.rating ?? null,
+      user_ratings_total: result.user_ratings_total ?? null,
     };
     const reviews: PlaceReview[] = result.reviews || [];
 
@@ -279,6 +367,8 @@ export async function getPlaceDetails(
       photos: (core.photos || []).slice(0, 4),
       reviews,
       rating: core.rating ?? null,
+      user_ratings_total: core.user_ratings_total ?? null,
+      placeId: placeId
     };
   } catch (err: any) {
     console.error("getPlaceDetails error:", err.message || err);

@@ -88,6 +88,8 @@ const fetchAndCacheGoogleData = async (facility: any) => {
         lng: parsed.lng,
         photos: photoUrls,
         reviews: parsed.reviews || [],
+        user_ratings_total: parsed.user_ratings_total || null, // Add this
+
       };
     }
 
@@ -119,11 +121,13 @@ const fetchAndCacheGoogleData = async (facility: any) => {
         lng: mongoCache.lng,
         photos: photoUrls,
         reviews: mongoCache.reviews,
+        user_ratings_total: mongoCache.user_ratings_total || null, // Add this
+
       };
     }
 
     // 3️⃣ If nothing in Redis or Mongo — fetch fresh from Google
-    return await refreshGoogleDataInBackground(facility, REDIS_KEY, true);
+    return await refreshGoogleDataInBackground(facility, REDIS_KEY);
   } catch (err) {
     console.error(`Google fetch failed for ${facility.provider_name}:`, err);
   }
@@ -136,6 +140,8 @@ const fetchAndCacheGoogleData = async (facility: any) => {
     lng: null,
     photos: [],
     reviews: [],
+    user_ratings_total: null, // Add this
+
   };
 };
 
@@ -146,85 +152,188 @@ const fetchAndCacheGoogleData = async (facility: any) => {
  * @param REDIS_KEY Redis cache key
  * @param immediateReturn If true, return the fetched data; else run in background
  */
-async function refreshGoogleDataInBackground(
-  facility: any,
-  REDIS_KEY: string,
-  immediateReturn: boolean = false
-) {
+
+// async function refreshGoogleDataInBackground(
+//   facility: any,
+//   REDIS_KEY: string,
+//   immediateReturn: boolean = false
+// ) {
+//   try {
+//     // 🚀 Faster for single facility: avoid batch processor
+//     const placeIdCandidates = await Promise.allSettled([
+//       findPlaceIdByText(facility.provider_name),
+//       findPlaceIdByText(`${facility.provider_name} ${facility.zip_code || ""}`.trim()),
+//       findPlaceIdByText(`${facility.provider_name} ${facility.city_town || ""}`.trim()),
+//     ]);
+
+//     const fulfilledCandidate = placeIdCandidates.find(
+//       (r): r is PromiseFulfilledResult<string | null> => r.status === "fulfilled" && !!(r as PromiseFulfilledResult<string | null>).value
+//     );
+//     const placeId = (fulfilledCandidate?.value ?? undefined) as string | undefined;
+
+//     if (!placeId) {
+//       return null;
+//     }
+
+//     const details = await getPlaceDetails(placeId);
+//     if (!details) {
+//       return null;
+//     }
+
+//     const photoReferences = details.photos
+//       ? details.photos.slice(0, 4).map((p: any) => p.photo_reference)
+//       : [];
+
+//     const reviews = (details.reviews || []).slice(0, 10).map((r: any) => ({
+//       author_name: r.author_name,
+//       rating: r.rating,
+//       text: r.text,
+//       relative_time_description: r.relative_time_description,
+//       profile_photo_url: r.profile_photo_url,
+//       author_url: r.author_url,
+//     }));
+
+//     const now = new Date();
+//     const newCache = {
+//       placeId,
+//       googleName: details.name,
+//       rating: details.rating,
+//       lat: details.lat,
+//       lng: details.lng,
+//       photoReferences,
+//       reviews,
+//       lastUpdated: now,
+//       reviewsLastUpdated: now,
+//     };
+
+//     await Promise.allSettled([
+//       setCache(REDIS_KEY, JSON.stringify(newCache)),
+//       Facility.updateOne(
+//         { _id: facility._id },
+//         { $set: { googleCache: newCache } },
+//         { upsert: true }
+//       ),
+//     ]);
+
+//     if (immediateReturn) {
+//       return {
+//         googleName: newCache.googleName,
+//         rating: newCache.rating,
+//         lat: newCache.lat,
+//         lng: newCache.lng,
+//         photos: photoReferences.map((ref) => googleService.getPhotoUrl(ref)),
+//         reviews,
+//       };
+//     }
+//   } catch (err) {
+//     console.error(`Background refresh failed for ${facility.provider_name}:`, err);
+//   }
+
+//   return null;
+// }
+
+
+// // Background refresh function
+// async function refreshGoogleDataInBackground(facility: any, redisKey: string) {
+//   try {
+//     console.log(`🔄 Refreshing Google data for facility: ${facility._id}`);
+    
+//     // Find place by facility address
+//     const placeId = await findPlaceIdByText(facility.location);
+//     if (!placeId) {
+//       console.log(`❌ No place found for facility: ${facility.provider_name}`);
+//       return;
+//     }
+
+//     // Get place details
+//     const placeDetails = await getPlaceDetails(placeId);
+//     if (!placeDetails) {
+//       console.log(`❌ No place details found for place: ${placeId}`);
+//       return;
+//     }
+
+//     // Prepare cache data
+//     const cacheData = {
+//       googleName: placeDetails.name,
+//       rating: placeDetails.rating,
+//       lat: placeDetails.lat || facility.latitude,
+//       lng: placeDetails.lng || facility.longitude,
+//       photoReferences: placeDetails.photos?.map((photo: any) => photo.photo_reference) || [],
+//       reviews: placeDetails.reviews || [],
+//       placeId: placeDetails.placeId,
+//       lastUpdated: new Date().toISOString(),
+//       reviewsLastUpdated: new Date().toISOString()
+//     };
+
+//     // Save to Redis
+//     await setCache(redisKey, JSON.stringify(cacheData));
+    
+//     // Save to MongoDB
+//     await NursingFacility.findByIdAndUpdate(facility._id, {
+//       googleCache: cacheData
+//     });
+
+//     console.log(`✅ Refreshed Google data for: ${facility.provider_name}`);
+//   } catch (error) {
+//     console.error(`❌ Failed to refresh Google data for ${facility._id}:`, error);
+//   }
+// }
+
+// Temporary: Disable all Google API refreshes
+// async function refreshGoogleDataInBackground(facility: any, redisKey: string) {
+//   console.log(`⚠️ Google API refresh disabled due to quota limits for: ${facility.provider_name}`);
+//   return; // Don't make any API calls
+// }
+
+const refreshGoogleDataInBackground = async (facility: any, redisKey: string) => {
   try {
-    // 🚀 Faster for single facility: avoid batch processor
-    const placeIdCandidates = await Promise.allSettled([
-      findPlaceIdByText(facility.provider_name),
-      findPlaceIdByText(`${facility.provider_name} ${facility.zip_code || ""}`.trim()),
-      findPlaceIdByText(`${facility.provider_name} ${facility.city_town || ""}`.trim()),
-    ]);
-
-    const fulfilledCandidate = placeIdCandidates.find(
-      (r): r is PromiseFulfilledResult<string | null> => r.status === "fulfilled" && !!(r as PromiseFulfilledResult<string | null>).value
-    );
-    const placeId = (fulfilledCandidate?.value ?? undefined) as string | undefined;
-
-    if (!placeId) {
-      return null;
+    // Fetch fresh data from Google Places API
+    const placeDetails = await googleService.getPlaceDetails(facility.place_id);
+    
+    if (!placeDetails) {
+      throw new Error('No place details found');
     }
 
-    const details = await getPlaceDetails(placeId);
-    if (!details) {
-      return null;
-    }
-
-    const photoReferences = details.photos
-      ? details.photos.slice(0, 4).map((p: any) => p.photo_reference)
-      : [];
-
-    const reviews = (details.reviews || []).slice(0, 10).map((r: any) => ({
-      author_name: r.author_name,
-      rating: r.rating,
-      text: r.text,
-      relative_time_description: r.relative_time_description,
-      profile_photo_url: r.profile_photo_url,
-      author_url: r.author_url,
-    }));
-
-    const now = new Date();
-    const newCache = {
-      placeId,
-      googleName: details.name,
-      rating: details.rating,
-      lat: details.lat,
-      lng: details.lng,
-      photoReferences,
-      reviews,
-      lastUpdated: now,
-      reviewsLastUpdated: now,
+    // Prepare the data to cache
+    const cacheData = {
+      googleName: placeDetails.name,
+      rating: placeDetails.rating,
+      lat: placeDetails.lat,
+      lng: placeDetails.lng,
+      photoReferences: placeDetails.photos?.map((photo: any) => photo.photo_reference) || [],
+      reviews: placeDetails.reviews || [],
+      user_ratings_total: placeDetails.user_ratings_total || null, // Add this
+      lastUpdated: new Date().toISOString(),
+      reviewsLastUpdated: new Date().toISOString(),
     };
 
-    await Promise.allSettled([
-      setCache(REDIS_KEY, JSON.stringify(newCache)),
-      Facility.updateOne(
-        { _id: facility._id },
-        { $set: { googleCache: newCache } },
-        { upsert: true }
-      ),
-    ]);
+    // Update Redis cache
+    await setCache(redisKey, JSON.stringify(cacheData));
 
-    if (immediateReturn) {
-      return {
-        googleName: newCache.googleName,
-        rating: newCache.rating,
-        lat: newCache.lat,
-        lng: newCache.lng,
-        photos: photoReferences.map((ref) => googleService.getPhotoUrl(ref)),
-        reviews,
-      };
-    }
+    // Update MongoDB cache (optional)
+    await Facility.findByIdAndUpdate(facility._id, {
+      $set: { googleCache: cacheData }
+    });
+
+    // Build photo URLs for immediate return
+    const photoUrls = cacheData.photoReferences
+      .slice(0, 4)
+      .map((ref: string) => googleService.getPhotoUrl(ref));
+
+    return {
+      googleName: cacheData.googleName,
+      rating: cacheData.rating,
+      lat: cacheData.lat,
+      lng: cacheData.lng,
+      photos: photoUrls,
+      reviews: cacheData.reviews,
+      user_ratings_total: cacheData.user_ratings_total, // Add this
+    };
   } catch (err) {
     console.error(`Background refresh failed for ${facility.provider_name}:`, err);
+    throw err;
   }
-
-  return null;
-}
-
+};
 
 // Fast, non-blocking Google data fetch: returns cached data immediately,
 // async function getGoogleDataFast(facility: any) {
@@ -305,6 +414,7 @@ async function refreshGoogleDataInBackground(
 // }
 
 
+// Complete getGoogleDataFast function
 async function getGoogleDataFast(facility: any) {
   const REDIS_KEY = `facility:${facility._id}:google`;
   const now = new Date();
@@ -325,7 +435,7 @@ async function getGoogleDataFast(facility: any) {
 
       const photoUrls = (parsed.photoReferences || [])
         .slice(0, 4)
-        .map((ref: string) => googleService.getPhotoUrl(ref));
+        .map((ref: string) => `https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photoreference=${ref}&key=${process.env.GOOGLE_API_KEY}`);
 
       return {
         googleName: parsed.googleName ?? null,
@@ -335,7 +445,8 @@ async function getGoogleDataFast(facility: any) {
         photos: photoUrls,
         reviews: parsed.reviews || [],
         hadCache: true,
-        placeId: parsed.placeId || null, // ✅ Added placeId
+        placeId: parsed.placeId || null,
+        photoReferences: parsed.photoReferences || []
       };
     }
 
@@ -344,7 +455,10 @@ async function getGoogleDataFast(facility: any) {
       // store to Redis for next time (non-blocking)
       setCache(REDIS_KEY, JSON.stringify(mongoCache)).catch(() => {});
 
-      const photoUrls = (mongoCache.photoReferences || []).slice(0, 4).map((ref: string) => googleService.getPhotoUrl(ref));
+      const photoUrls = (mongoCache.photoReferences || []).slice(0, 4).map((ref: string) => 
+        `https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photoreference=${ref}&key=${process.env.GOOGLE_API_KEY}`
+      );
+      
       // background refresh if stale
       const lastUpdated = new Date(mongoCache.lastUpdated);
       const isCoreStale = now.getTime() - lastUpdated.getTime() > ONE_YEAR_MS;
@@ -362,11 +476,13 @@ async function getGoogleDataFast(facility: any) {
         photos: photoUrls,
         reviews: mongoCache.reviews || [],
         hadCache: true,
-        placeId: mongoCache.placeId || null, // ✅ Added placeId
+        placeId: mongoCache.placeId || null,
+        photoReferences: mongoCache.photoReferences || []
       };
     }
   } catch (e) {
     // ignore and fallback to background
+    console.error('Error in getGoogleDataFast:', e);
   }
 
   // Trigger background refresh immediately for first-time users
@@ -381,14 +497,15 @@ async function getGoogleDataFast(facility: any) {
     photos: [],
     reviews: [],
     hadCache: false,
-    placeId: null, // ✅ Added placeId
+    placeId: null,
+    photoReferences: []
   };
 }
 
 
 
+
 // Get Facility Details
-// ✅ Get Facility Details (Type-safe & Stable)
 export const getFacilityDetails = async (
   req: Request,
   res: Response,
@@ -460,6 +577,7 @@ export const getFacilityDetails = async (
       lng: null,
       photos: [],
       reviews: [],
+      user_ratings_total: null, // Add this default
     };
 
     // ✅ Safe default AI summary
@@ -488,6 +606,7 @@ export const getFacilityDetails = async (
       reviews: googleData.reviews ?? [],
       lat: googleData.lat ?? null,
       lng: googleData.lng ?? null,
+      user_ratings_total: googleData.user_ratings_total ?? null,
       aiSummary,
     });
   } catch (err) {
@@ -608,21 +727,60 @@ const stateToAbbr: Record<string, string> = {
 
 
 // ✅ Detect ZIP / State / City
-function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
-  const cleanQ = q.trim().toLowerCase();
-  const zipRegex = /^\d{5}$/;
+// function normalizeQuery(q: string): { type: "zip" | "state" | "city"; value: string } {
+//   const cleanQ = q.trim().toLowerCase();
+//   const zipRegex = /^\d{5}$/;
 
-  if (zipRegex.test(cleanQ)) return { type: "zip", value: cleanQ };
+//   if (zipRegex.test(cleanQ)) return { type: "zip", value: cleanQ };
 
-  const stateMatch = Object.keys(stateToAbbr).find(
-    (state) => state.toLowerCase() === cleanQ || state.toLowerCase().startsWith(cleanQ)
-  );
+//   const stateMatch = Object.keys(stateToAbbr).find(
+//     (state) => state.toLowerCase() === cleanQ || state.toLowerCase().startsWith(cleanQ)
+//   );
 
-  if (stateMatch) return { type: "state", value: stateToAbbr[stateMatch] };
+//   if (stateMatch) return { type: "state", value: stateToAbbr[stateMatch] };
 
-  return { type: "city", value: q };
+//   return { type: "city", value: q };
+// }
+
+// Helper function to normalize search queries - COMPLETE FIXED VERSION
+function normalizeQuery(query: string): { type: 'zip' | 'city' | 'state' | 'other'; value: string } {
+  const trimmed = query.trim().toLowerCase();
+  
+  // Check for ZIP code (5 digits)
+  const zipMatch = trimmed.match(/^\d{5}$/);
+  if (zipMatch) return { type: 'zip', value: trimmed };
+  
+  // Check for state names and abbreviations
+  const stateMap: Record<string, string> = {
+    "new york": "NY",
+    "new jersey": "NJ", 
+    "connecticut": "CT",
+    "pennsylvania": "PA",
+    "ny": "NY",
+    "nj": "NJ",
+    "ct": "CT", 
+    "pa": "PA"
+  };
+  
+  const normalizedState = stateMap[trimmed];
+  if (normalizedState) {
+    return { type: 'state', value: normalizedState };
+  }
+  
+  // Check for partial state matches (like "new york" in "new_york_city")
+  for (const [stateName, abbr] of Object.entries(stateMap)) {
+    if (trimmed.includes(stateName)) {
+      return { type: 'state', value: abbr };
+    }
+  }
+  
+  // Check for city (simple heuristic)
+  if (trimmed.length > 2 && /^[a-zA-z\s]+$/.test(trimmed.replace(/_/g, ' '))) {
+    return { type: 'city', value: trimmed.replace(/_/g, ' ') };
+  }
+  
+  return { type: 'other', value: trimmed.replace(/_/g, ' ') };
 }
-
 
 type FacilityType = any; 
 
@@ -958,6 +1116,7 @@ type FacilityType = any;
 //     res.status(500).json({ error: err.message });
 //   }
 // };
+// Main search function
 export const searchFacilitiesWithReviews = async (
   req: Request,
   res: Response,
@@ -978,6 +1137,8 @@ export const searchFacilitiesWithReviews = async (
     const baseCacheKey = `facility:query:${q || `${lat},${lng}`}`;
     const pageCacheKey = `${baseCacheKey}&page:${pageNum}`;
 
+    console.log('🔍 Search parameters:', { q, page: pageNum, limit: limitNum, cacheKey: pageCacheKey });
+
     // -----------------------------
     // 1️⃣ Redis Cache
     // -----------------------------
@@ -987,6 +1148,7 @@ export const searchFacilitiesWithReviews = async (
       if (!parsed.data?.length) {
         await deleteCache(pageCacheKey);
       } else {
+        console.log('⚡ Serving from Redis cache');
         return res.status(200).json({ ...parsed, cached: true, from: "redis" });
       }
     }
@@ -999,6 +1161,7 @@ export const searchFacilitiesWithReviews = async (
       if (!mongoCache.data?.data?.length) {
         await CachedSearchResult.deleteOne({ key: pageCacheKey });
       } else {
+        console.log('🗄️ Serving from MongoDB cache');
         await setCache(pageCacheKey, JSON.stringify(mongoCache.data), ONE_YEAR_MS);
         return res
           .status(200)
@@ -1085,10 +1248,10 @@ export const searchFacilitiesWithReviews = async (
         }
 
         const normalizedZip = zipNumber.toString().padStart(5, "0");
-        console.log("normalizedZip ZIP:", normalizedZip);
+        console.log("ZIP search:", normalizedZip);
 
         let zipTotal = await NursingFacility.countDocuments({ zip_code: normalizedZip });
-        console.log("Initial ZIP count:", zipTotal);
+        console.log("ZIP count:", zipTotal);
         
         if (zipTotal > 0) {
           const facilityZip = await NursingFacility.findOne({ zip_code: normalizedZip }).select("state").lean();
@@ -1114,7 +1277,6 @@ export const searchFacilitiesWithReviews = async (
             const placeName = `${normalizedZip}, USA`;
             const { lat, lng } = await getCoordinatesByPlaceName(placeName);
             console.log("Google Coordinates:", { lng, lat });
-            console.log('allowed states', allowedAbbr);
             
             facilities = await NursingFacility.find({
               geoLocation: {
@@ -1226,10 +1388,13 @@ export const searchFacilitiesWithReviews = async (
         from: "db",
       });
     }
+
+    console.log(`🏥 Found ${facilities.length} facilities from database`);
  
     // -----------------------------
     // 5️⃣ Google + AI Enrichment
     // -----------------------------
+    console.log('🔍 Fetching Google data...');
     const googleResults = await Promise.all(
       facilities.map((f) => getGoogleDataFast(f))
     );
@@ -1240,41 +1405,66 @@ export const searchFacilitiesWithReviews = async (
         : ""
     );
     
+    console.log('🤖 Generating AI summaries...');
     const aiSummaries = await summarizeReviewsBatch(reviewsTexts);
 
     // -----------------------------
     // 🖼️ 6️⃣ Image Caching Integration
     // -----------------------------
+    console.log('🖼️ Starting image caching...');
     const facilitiesWithCachedPhotos = await Promise.all(
       facilities.map(async (f: any, i: number) => {
         const gd = googleResults[i] ?? {};
-        const photoRefs = gd.photos || [];
         
+        // ✅ Use photoReferences from the Google data result
+        const photoRefs = gd.photoReferences || [];
+        
+        console.log(`🖼️ Facility ${f._id}:`, {
+          hasGoogleData: !!gd,
+          photoRefsCount: photoRefs.length,
+          placeId: gd.placeId,
+          googleName: gd.googleName
+        });
+
         // Get cached photo URLs for this facility
         let cachedPhotoUrls: string[] = [];
         
         if (photoRefs.length > 0) {
           try {
-            // Use batch caching for better performance
+            console.log(`  📸 Processing ${photoRefs.length} photo references for facility ${f._id}`);
+            
             cachedPhotoUrls = await Promise.all(
-              photoRefs.slice(0, 4).map((photoRef: string) => 
-                getCachedPhotoUrl(photoRef, 600, f._id?.toString(), gd.placeId)
-              )
+              photoRefs.slice(0, 4).map(async (photoRef: string, index: number) => {
+                console.log(`    🔄 Caching photo ${index + 1}: ${photoRef.substring(0, 20)}...`);
+                const url = await getCachedPhotoUrl(
+                  photoRef, 
+                  600, 
+                  f._id?.toString(), 
+                  gd.placeId
+                );
+                console.log(`    ✅ Photo ${index + 1}: ${url ? 'CACHED' : 'FAILED'}`);
+                return url;
+              })
             );
             
             // Filter out null values
             cachedPhotoUrls = cachedPhotoUrls.filter(url => url !== null) as string[];
+            console.log(`  🎉 Successfully cached ${cachedPhotoUrls.length}/${photoRefs.length} photos`);
           } catch (error) {
-            console.error(`Error caching photos for facility ${f._id}:`, error);
+            console.error(`❌ Error caching photos for facility ${f._id}:`, error);
           }
+        } else {
+          console.log(`  ℹ️ No photo references found for facility ${f._id}`);
+          // If no photo references, use the direct photo URLs from Google
+          cachedPhotoUrls = gd.photos || [];
         }
 
         return {
           ...f,
           googleName: gd.googleName ?? null,
           rating: gd.rating ?? null,
-          photos: cachedPhotoUrls, // Now returns cached photo URLs instead of references
-          photoRefs: photoRefs, // Keep original references for future caching
+          photos: cachedPhotoUrls, // Cached photo URLs (our local cached versions)
+          photoRefs: photoRefs, // Original Google photo references
           lat: gd.lat ?? f.latitude ?? null,
           lng: gd.lng ?? f.longitude ?? null,
           aiSummary: aiSummaries[i] || { summary: "", pros: [], cons: [] },
@@ -1286,27 +1476,31 @@ export const searchFacilitiesWithReviews = async (
     // -----------------------------
     // 7️⃣ Batch Cache Photos for Next Requests (Non-blocking)
     // -----------------------------
-    if (pageNum <= 3) { // Only pre-cache for first few pages
+    if (pageNum <= 3) {
       const facilitiesForBatchCache = facilities.map((f: any, i: number) => {
         const gd = googleResults[i] ?? {};
         return {
           id: f._id?.toString(),
-          photoRefs: gd.photos || [],
+          photoRefs: gd.photoReferences || [],
           googlePlaceId: gd.placeId
         };
       }).filter(f => f.photoRefs.length > 0);
 
       if (facilitiesForBatchCache.length > 0) {
-        // Cache in background without awaiting
+        console.log(`🔄 Background caching ${facilitiesForBatchCache.length} facilities`);
         batchCacheFacilityPhotos(facilitiesForBatchCache, 600)
           .then(results => {
-            console.log(`🔄 Background cached ${Array.from(results.values()).flat().length} photos for ${results.size} facilities`);
+            const totalCached = Array.from(results.values()).flat().length;
+            console.log(`✅ Background cached ${totalCached} photos for ${results.size} facilities`);
           })
           .catch(error => {
-            console.error('Background photo caching error:', error);
+            console.error('❌ Background photo caching error:', error);
           });
       }
     }
+
+    const totalCachedPhotos = facilitiesWithCachedPhotos.reduce((count, facility) => count + facility.photos.length, 0);
+    const totalPhotoRefs = facilitiesWithCachedPhotos.reduce((count, facility) => count + facility.photoRefs.length, 0);
 
     const responseData = {
       data: facilitiesWithCachedPhotos,
@@ -1316,15 +1510,19 @@ export const searchFacilitiesWithReviews = async (
       cached: false,
       from: pageNum <= 6 ? "db" : "db+google+ai",
       imageCacheInfo: {
-        cachedPhotos: facilitiesWithCachedPhotos.reduce((count, facility) => count + facility.photos.length, 0),
-        totalPhotoRefs: facilitiesWithCachedPhotos.reduce((count, facility) => count + facility.photoRefs.length, 0)
+        cachedPhotos: totalCachedPhotos,
+        totalPhotoRefs: totalPhotoRefs,
+        cacheRate: totalPhotoRefs > 0 ? ((totalCachedPhotos / totalPhotoRefs) * 100).toFixed(1) + '%' : '0%'
       }
     };
+
+    console.log(`📊 Final stats: ${totalCachedPhotos}/${totalPhotoRefs} photos cached (${responseData.imageCacheInfo.cacheRate})`);
 
     // -----------------------------
     // 8️⃣ Cache Non-Empty Results
     // -----------------------------
     if (responseData.data.length) {
+      console.log(`💾 Caching results to Redis and MongoDB`);
       await setCache(pageCacheKey, JSON.stringify(responseData), ONE_YEAR_MS);
       await CachedSearchResult.updateOne(
         { key: pageCacheKey },
@@ -2567,5 +2765,221 @@ export const resetGoogleApiUsageStats = async (
   } catch (err) {
     console.error("❌ Error in resetGoogleApiUsageStats:", err);
     next(err);
+  }
+};
+
+
+// // Add this to your controller
+// export const refreshFacilityGoogleData = async (req: Request, res: Response) => {
+//   try {
+//     const { facilityId } = req.params;
+//     console.log(`🔄 Refresh request for facility ID: ${facilityId}`);
+//     const facility = await NursingFacility.findById(facilityId);
+//     if (!facility) {
+//       return res.status(404).json({ error: 'Facility not found' });
+//     }
+
+//     // Force refresh by calling the background refresh function directly
+//     const REDIS_KEY = `facility:${facilityId}:google`;
+    
+//     // Clear existing cache
+//     await deleteCache(REDIS_KEY);
+    
+//     // Trigger refresh
+//     await refreshGoogleDataInBackground(facility, REDIS_KEY);
+    
+//     res.json({ 
+//       message: 'Google data refresh triggered',
+//       facilityId,
+//       status: 'processing'
+//     });
+//   } catch (error) {
+//     console.error('Refresh error:', error);
+//     res.status(500).json({ error: 'Refresh failed' });
+//   }
+// };
+
+// Additional utility endpoints
+export const refreshFacilityGoogleData = async (req: Request, res: Response) => {
+  try {
+    const { facilityId } = req.params;
+    
+    const facility = await NursingFacility.findById(facilityId);
+    if (!facility) {
+      return res.status(404).json({ error: 'Facility not found' });
+    }
+
+    const REDIS_KEY = `facility:${facilityId}:google`;
+    
+    // Clear existing cache
+    await deleteCache(REDIS_KEY);
+    
+    // Trigger refresh
+    await refreshGoogleDataInBackground(facility, REDIS_KEY);
+    
+    res.json({ 
+      message: 'Google data refresh triggered',
+      facilityId,
+      status: 'processing'
+    });
+  } catch (error) {
+    console.error('Refresh error:', error);
+    res.status(500).json({ error: 'Refresh failed' });
+  }
+};
+
+
+// Batch refresh multiple facilities
+export const batchRefreshGoogleData = async (req: Request, res: Response) => {
+  try {
+    const { limit = 10 } = req.query;
+    
+    const facilities = await NursingFacility.find()
+      .limit(Number(limit))
+      .lean();
+
+    const results = await Promise.all(
+      facilities.map(async (facility) => {
+        const REDIS_KEY = `facility:${facility._id}:google`;
+        await deleteCache(REDIS_KEY);
+        await refreshGoogleDataInBackground(facility, REDIS_KEY);
+        return { facilityId: facility._id, status: 'refreshed' };
+      })
+    );
+
+    res.json({
+      message: `Refreshed Google data for ${results.length} facilities`,
+      results
+    });
+  } catch (error) {
+    console.error('Batch refresh error:', error);
+    res.status(500).json({ error: 'Batch refresh failed' });
+  }
+};
+
+export const testGoogleApi = async (req: Request, res: Response) => {
+  try {
+    const testAddress = "2000 EAST MAIN STREET,PEEKSKILL,NY,10566";
+    
+    const coords = await getCoordinatesByPlaceName(testAddress);
+    const placeId = await findPlaceIdByText(testAddress);
+    
+    let details = null;
+    if (placeId) {
+      details = await getPlaceDetails(placeId);
+    }
+    
+    res.json({
+      geocoding: coords,
+      placeId,
+      details: details ? {
+        name: details.name,
+        rating: details.rating,
+        photos: details.photos?.length || 0,
+        photoReferences: details.photos?.slice(0, 2).map((p: any) => p.photo_reference) || []
+      } : null,
+      status: 'Google API test completed'
+    });
+  } catch (error: any) {
+    console.error('Google API test failed:', error);
+    res.status(500).json({ error: 'Google API test failed', details: error.message });
+  }
+};
+
+
+
+export const testGooglePlacesApi = async (req: Request, res: Response) => {
+  try {
+    const { testQuery = "2000 EAST MAIN STREET,PEEKSKILL,NY,10566" } = req.query;
+    
+    console.log('🧪 Testing Google Places API...');
+    
+    // Test 1: Check API key
+    const apiKey = process.env.GOOGLE_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ 
+        error: 'No Google API key found',
+        status: 'FAILED'
+      });
+    }
+
+    console.log('✅ API Key found:', apiKey.substring(0, 10) + '...');
+
+    // Test 2: Test Places API findPlaceFromText directly
+    const placesUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=${encodeURIComponent(testQuery as string)}&inputtype=textquery&fields=place_id,name,rating,photos&key=${apiKey}`;
+    
+    console.log('🔍 Testing Places API...');
+    const placesResponse = await fetch(placesUrl);
+    const placesData = await placesResponse.json();
+    
+    console.log('📊 Places API Response:', {
+      status: placesData.status,
+      candidates: placesData.candidates?.length || 0
+    });
+
+    // Test 3: Test your existing functions
+    console.log('🔍 Testing findPlaceIdByText...');
+    const placeId = await findPlaceIdByText(testQuery as string);
+    
+    let placeDetails = null;
+    if (placeId) {
+      console.log('📋 Testing getPlaceDetails...');
+      placeDetails = await getPlaceDetails(placeId);
+    }
+
+    // Test 4: Test photo URL generation
+    let testPhotoUrl = null;
+    if (placeDetails?.photos?.[0]) {
+      testPhotoUrl = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photoreference=${placeDetails.photos[0].photo_reference}&key=${apiKey}`;
+    }
+
+    const result = {
+      apiKey: {
+        exists: !!apiKey,
+        preview: apiKey.substring(0, 10) + '...'
+      },
+      directPlacesApi: {
+        url: placesUrl.substring(0, 100) + '...',
+        status: placesData.status,
+        candidates: placesData.candidates?.length || 0,
+        candidateDetails: placesData.candidates?.[0] ? {
+          place_id: placesData.candidates[0].place_id,
+          name: placesData.candidates[0].name,
+          rating: placesData.candidates[0].rating,
+          photos_count: placesData.candidates[0].photos?.length || 0
+        } : null
+      },
+      yourFunctions: {
+        findPlaceIdByText: {
+          success: !!placeId,
+          placeId: placeId
+        },
+        getPlaceDetails: {
+          success: !!placeDetails,
+          details: placeDetails ? {
+            name: placeDetails.name,
+            rating: placeDetails.rating,
+            photos_count: placeDetails.photos?.length || 0,
+            reviews_count: placeDetails.reviews?.length || 0
+          } : null
+        }
+      },
+      photoTest: {
+        canGenerateUrl: !!testPhotoUrl,
+        sampleUrl: testPhotoUrl ? testPhotoUrl.substring(0, 100) + '...' : null
+      },
+      status: placesData.status === 'OK' ? 'WORKING' : 'FAILED'
+    };
+
+    console.log('🎯 Test Results:', JSON.stringify(result, null, 2));
+    
+    res.json(result);
+
+  } catch (error: any) {
+    console.error('❌ Google Places API Test Failed:', error);
+    res.status(500).json({
+      error: error.message,
+      status: 'FAILED'
+    });
   }
 };
