@@ -26,6 +26,12 @@ import { getCache, setCache } from "./config/redisClient";
 // Cron jobs
 import "./cron/facilityCron";
 
+// Import new admin routes
+import adminRoutes from "./routes/adminRoutes";
+import blogRoutes from "./routes/blogRoutes";
+import newsRoutes from "./routes/newsRoutes";
+import sponsoredRoutes from "./routes/sponsoredRoutes";
+
 const app: Application = express();
 // const corsOptions = {
 //     origin: 'https://carenav.io/', 
@@ -53,6 +59,13 @@ app.use("/api/auth", authRoutes);
 app.use("/api/facilities", facilityRoutes);
 app.use("/api/ai", aiRoutes);
 app.use("/api/google", googleRoutes);
+
+// New admin routes
+app.use("/api/admin", adminRoutes);
+app.use("/api/blogs", blogRoutes);
+app.use("/api/news", newsRoutes);
+app.use("/api/sponsored", sponsoredRoutes);
+
 
 
 app.use("/api/place", placeRoutes);

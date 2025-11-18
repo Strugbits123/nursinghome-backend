@@ -1,0 +1,7 @@
+// import express, { Request, Response } from 'express';
+// import { SponsoredFacility } from '../models/SponsoredFacility';
+// import NursingFacility from '../models/NursingFacility';
+
+// const router = express.Router();
+
+// export default router;

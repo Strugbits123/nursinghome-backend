@@ -127,6 +127,15 @@ export interface INursingFacility extends Document {
     type: 'Point';
     coordinates: [number, number];
   };
+  sponsored: boolean;
+  sponsoredAt: Date | null;
+  sponsoredExpiresAt: Date | null;
+  sponsoredBy: {
+    name: string;
+    email: string;
+    phone: string;
+    submittedAt: Date;
+  } | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -238,6 +247,15 @@ const NursingFacilitySchema = new Schema<INursingFacility>({
   processing_date: { type: Date },
     rating: { type: Number, default: null },
 
+  sponsored: { type: Boolean, default: false },
+  sponsoredAt: { type: Date, default: null },
+  sponsoredExpiresAt: { type: Date, default: null },
+  sponsoredBy: {
+    name: { type: String },
+    email: { type: String },
+    phone: { type: String },
+    submittedAt: { type: Date }
+  }
 }, { timestamps: true });
 
 NursingFacilitySchema.index({ geoLocation: '2dsphere' });

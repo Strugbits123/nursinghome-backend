@@ -32,13 +32,15 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.18.2",
     "node-cron": "^4.2.1",
+    "nodemailer": "^7.0.10",
     "openai": "^5.19.1"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.3",
+    "@types/express": "^5.0.5",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.5.2",
+    "@types/nodemailer": "^7.0.3",
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.2"

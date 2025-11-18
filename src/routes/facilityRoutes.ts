@@ -8,10 +8,11 @@ import {
   getTop10Facilities,
   refreshFacilityGoogleData,
   batchRefreshGoogleData,
-   testGooglePlacesApi
+  testGooglePlacesApi,
+  getAllFacilities
 } from "../controllers/facilityController";
 import { protect } from "../middleware/authMiddleware";
-import { Router, Request, Response, NextFunction } from "express";
+import { Router } from "express";
 
 const router = Router();
 
@@ -19,6 +20,7 @@ router.get("/with-reviews", searchFacilitiesWithReviews);
 router.get('/details', getFacilityDetails); 
 router.get("/filter-with-reviews", filterFacilitiesWithReviews);
 router.get("/top-10", getTop10Facilities);
+router.get("/all", getAllFacilities);
 
 
 router.get('/:facilityId/refresh-google', refreshFacilityGoogleData);
