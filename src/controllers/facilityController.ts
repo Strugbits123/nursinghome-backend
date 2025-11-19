@@ -1501,6 +1501,7 @@ type FacilityType = any;
 //     res.status(500).json({ error: err.message });
 //   }
 // };
+
 // Main search function
 export const searchFacilitiesWithReviews = async (
   req: Request,
@@ -1540,7 +1541,7 @@ export const searchFacilitiesWithReviews = async (
         const validatedResponse = await validateAndUpdateSponsoredFacilities(parsed, q, lat, lng);
         
         if (validatedResponse.updated) {
-          console.log('🔄 Updated sponsored facilities in cached response');
+          console.log('🔄 Updated sponsored facilities in cached response - UPDATING CACHE');
           // Update cache with validated response
           await setCache(pageCacheKey, JSON.stringify(validatedResponse.data), ONE_YEAR_MS);
           await CachedSearchResult.updateOne(
@@ -1548,9 +1549,24 @@ export const searchFacilitiesWithReviews = async (
             { $set: { data: validatedResponse.data } },
             { upsert: true }
           );
+          
+          // Return the UPDATED response
+          return res.status(200).json({ 
+            ...validatedResponse.data, 
+            cached: true, 
+            from: "redis-updated", 
+            sponsoredValidated: true 
+          });
+        } else {
+          console.log('✅ No changes needed to sponsored facilities in cache');
+          // Return the original cached response
+          return res.status(200).json({ 
+            ...parsed, 
+            cached: true, 
+            from: "redis", 
+            sponsoredValidated: false 
+          });
         }
-        
-        return res.status(200).json({ ...validatedResponse.data, cached: true, from: "redis", sponsoredValidated: validatedResponse.updated });
       }
     }
 
@@ -1568,7 +1584,7 @@ export const searchFacilitiesWithReviews = async (
         const validatedResponse = await validateAndUpdateSponsoredFacilities(mongoCache.data, q, lat, lng);
         
         if (validatedResponse.updated) {
-          console.log('🔄 Updated sponsored facilities in cached response');
+          console.log('🔄 Updated sponsored facilities in cached response - UPDATING CACHE');
           // Update cache with validated response
           await setCache(pageCacheKey, JSON.stringify(validatedResponse.data), ONE_YEAR_MS);
           await CachedSearchResult.updateOne(
@@ -1576,9 +1592,22 @@ export const searchFacilitiesWithReviews = async (
             { $set: { data: validatedResponse.data } },
             { upsert: true }
           );
+          
+          return res.status(200).json({ 
+            ...validatedResponse.data, 
+            cached: true, 
+            from: "mongo-cache-updated", 
+            sponsoredValidated: true 
+          });
+        } else {
+          console.log('✅ No changes needed to sponsored facilities in cache');
+          return res.status(200).json({ 
+            ...mongoCache.data, 
+            cached: true, 
+            from: "mongo-cache", 
+            sponsoredValidated: false 
+          });
         }
-        
-        return res.status(200).json({ ...validatedResponse.data, cached: true, from: "mongo-cache", sponsoredValidated: validatedResponse.updated });
       }
     }
 
@@ -2208,12 +2237,12 @@ export const searchFacilitiesWithReviews = async (
   }
 };
 
-// NEW FUNCTION: Validate and update sponsored facilities in cached responses
+// FIXED FUNCTION: Validate and update sponsored facilities in cached responses
 const validateAndUpdateSponsoredFacilities = async (cachedResponse: any, q?: string, lat?: string, lng?: string) => {
   try {
     console.log('🔄 Validating sponsored facilities in cached response...');
     
-    // Get current active sponsored facilities
+    // Get ALL current active sponsored facilities from database
     const currentActiveSponsored = await SponsoredFacility.find({
       isActive: true,
       startDate: { $lte: new Date() },
@@ -2222,61 +2251,94 @@ const validateAndUpdateSponsoredFacilities = async (cachedResponse: any, q?: str
       .populate('facility')
       .lean();
 
-    const currentSponsoredIds = new Set(
-      currentActiveSponsored.map(sp => sp.facility?._id?.toString()).filter(Boolean)
-    );
+    console.log('🔍 DEBUG: Current active sponsored facilities from DB:');
+    currentActiveSponsored.forEach((sponsored: any, index: number) => {
+      const facility = sponsored.facility;
+      if (facility) {
+        console.log(`   ${index + 1}. ${facility.provider_name} (ID: ${facility._id}) - Active: ${sponsored.isActive}`);
+      } else {
+        console.log(`   ${index + 1}. ❌ NO FACILITY DATA - Sponsored ID: ${sponsored._id}`);
+      }
+    });
 
-    console.log(`📊 Current active sponsored facilities: ${currentActiveSponsored.length}`);
+    // Create a map of currently active sponsored facility IDs for quick lookup
+    const currentActiveSponsoredMap = new Map();
+    currentActiveSponsored.forEach(sponsored => {
+      if (sponsored.facility && sponsored.facility._id) {
+        const facilityId = sponsored.facility._id.toString();
+        currentActiveSponsoredMap.set(facilityId, sponsored);
+      }
+    });
+
+    console.log(`📊 Current active sponsored facilities in DB: ${currentActiveSponsored.length}`);
     console.log(`📊 Cached sponsored facilities: ${cachedResponse.data?.filter((f: any) => f.isSponsored).length || 0}`);
 
     let updated = false;
     const updatedData = [...cachedResponse.data];
 
-    // Check each facility in cached response
+    // Step 1: REMOVE deactivated sponsored facilities from page 1 cache
+    console.log('🔍 Checking for deactivated sponsored facilities to REMOVE from page 1...');
+    const facilitiesToRemove: number[] = []; // Store indices to remove
+    
     for (let i = 0; i < updatedData.length; i++) {
       const facility = updatedData[i];
+      const facilityId = facility._id?.toString();
       
+      console.log(`   Checking facility: ${facility.provider_name} (ID: ${facilityId})`);
+      console.log(`     Current isSponsored: ${facility.isSponsored}`);
+      console.log(`     Has sponsoredBy: ${!!facility.sponsoredBy}`);
+      console.log(`     Has sponsoredData: ${!!facility.sponsoredData}`);
+
+      // If facility was sponsored in cache but is NOT actively sponsored in DB
       if (facility.isSponsored) {
-        const facilityId = facility._id?.toString();
-        const isCurrentlySponsored = currentSponsoredIds.has(facilityId);
+        const currentSponsoredData = currentActiveSponsoredMap.get(facilityId);
         
-        if (!isCurrentlySponsored) {
-          console.log(`❌ Removing expired sponsored facility: ${facility.provider_name}`);
-          // Remove sponsored status
-          updatedData[i] = {
-            ...facility,
-            isSponsored: false,
-            sponsoredData: undefined
-          };
+        if (!currentSponsoredData) {
+          // This facility was sponsored but is NO LONGER active - REMOVE IT from page 1
+          console.log(`   🗑️ REMOVING FROM PAGE 1: ${facility.provider_name} - no longer actively sponsored`);
+          facilitiesToRemove.push(i);
           updated = true;
         } else {
-          // Update sponsored data with current priority and dates
-          const currentSponsored = currentActiveSponsored.find(
-            sp => sp.facility?._id?.toString() === facilityId
-          );
-          
-          if (currentSponsored && (
-            facility.sponsoredData?.priority !== currentSponsored.priority ||
-            facility.sponsoredData?.startDate !== currentSponsored.startDate?.toISOString() ||
-            facility.sponsoredData?.endDate !== currentSponsored.endDate?.toISOString()
-          )) {
-            console.log(`🔄 Updating sponsored data for: ${facility.provider_name}`);
+          // Facility is still sponsored - update data if needed
+          console.log(`   ✅ STILL SPONSORED: ${facility.provider_name}`);
+          const needsUpdate = 
+            facility.sponsoredData?.priority !== currentSponsoredData.priority ||
+            new Date(facility.sponsoredData?.startDate).getTime() !== new Date(currentSponsoredData.startDate).getTime() ||
+            new Date(facility.sponsoredData?.endDate).getTime() !== new Date(currentSponsoredData.endDate).getTime() ||
+            JSON.stringify(facility.sponsoredData?.sponsoredBy) !== JSON.stringify(currentSponsoredData.sponsoredBy);
+
+          if (needsUpdate) {
+            console.log(`   🔄 UPDATING SPONSORED DATA: ${facility.provider_name}`);
             updatedData[i] = {
               ...facility,
               sponsoredData: {
-                priority: currentSponsored.priority || 1,
-                startDate: currentSponsored.startDate,
-                endDate: currentSponsored.endDate,
-                sponsoredBy: currentSponsored.sponsoredBy
+                priority: currentSponsoredData.priority || 1,
+                startDate: currentSponsoredData.startDate,
+                endDate: currentSponsoredData.endDate,
+                sponsoredBy: currentSponsoredData.sponsoredBy
               }
             };
             updated = true;
           }
         }
+      } else if (facility.sponsoredBy || facility.sponsoredData) {
+        // Facility has leftover sponsored data but is not marked as sponsored - clean it up
+        console.log(`   🧹 CLEANING LEFTOVER SPONSORED DATA: ${facility.provider_name}`);
+        const { sponsoredBy, sponsoredData, ...cleanFacility } = facility;
+        updatedData[i] = cleanFacility;
+        updated = true;
       }
     }
 
-    // Add new sponsored facilities that match search criteria but aren't in cached response
+    // Remove the deactivated sponsored facilities from the array (in reverse order to avoid index issues)
+    for (let i = facilitiesToRemove.length - 1; i >= 0; i--) {
+      const indexToRemove = facilitiesToRemove[i];
+      console.log(`   Removing facility at index ${indexToRemove}: ${updatedData[indexToRemove]?.provider_name}`);
+      updatedData.splice(indexToRemove, 1);
+    }
+
+    // Step 2: Add NEW sponsored facilities that match search criteria but aren't in cached response
+    console.log('🔍 Checking for new sponsored facilities to add to page 1...');
     if (q || (lat && lng)) {
       const matchingSponsoredFacilities = await getMatchingSponsoredFacilities(
         currentActiveSponsored, q, lat, lng
@@ -2284,11 +2346,18 @@ const validateAndUpdateSponsoredFacilities = async (cachedResponse: any, q?: str
 
       const newSponsoredFacilities = matchingSponsoredFacilities.filter(sponsored => {
         const facilityId = sponsored.facility._id.toString();
-        return !updatedData.some((f: any) => f._id?.toString() === facilityId);
+        // Only add if not already in the response
+        const alreadyExists = updatedData.some((f: any) => f._id?.toString() === facilityId);
+        if (!alreadyExists) {
+          console.log(`   ➕ ADDING NEW SPONSORED TO PAGE 1: ${sponsored.facility.provider_name}`);
+        } else {
+          console.log(`   ⚠️  ALREADY EXISTS: ${sponsored.facility.provider_name}`);
+        }
+        return !alreadyExists;
       });
 
       if (newSponsoredFacilities.length > 0) {
-        console.log(`➕ Adding ${newSponsoredFacilities.length} new sponsored facilities to cached response`);
+        console.log(`➕ Adding ${newSponsoredFacilities.length} new sponsored facilities to page 1 cache`);
         
         const newSponsoredFormatted = newSponsoredFacilities.map(sponsored => ({
           ...sponsored.facility,
@@ -2301,20 +2370,32 @@ const validateAndUpdateSponsoredFacilities = async (cachedResponse: any, q?: str
           }
         }));
 
-        // Add new sponsored facilities at the beginning
+        // Add new sponsored facilities at the beginning to ensure they show on top
         updatedData.unshift(...newSponsoredFormatted);
         updated = true;
+      } else {
+        console.log('   ✅ No new sponsored facilities to add to page 1');
       }
     }
 
+    // Step 3: If we made changes, re-sort and update response structure
     if (updated) {
-      // Re-sort to ensure sponsored facilities are at the top
+      console.log('🔄 Re-sorting facilities after sponsored updates...');
+      
+      // Re-sort to ensure sponsored facilities are at the top by priority
       updatedData.sort((a: any, b: any) => {
+        // First priority: sponsored facilities
         if (a.isSponsored && !b.isSponsored) return -1;
         if (!a.isSponsored && b.isSponsored) return 1;
+        
+        // Both sponsored: sort by priority (higher priority first)
         if (a.isSponsored && b.isSponsored) {
-          return (b.sponsoredData?.priority || 1) - (a.sponsoredData?.priority || 1);
+          const priorityA = a.sponsoredData?.priority || 1;
+          const priorityB = b.sponsoredData?.priority || 1;
+          return priorityB - priorityA; // Higher priority first
         }
+        
+        // Both not sponsored: maintain original order
         return 0;
       });
 
@@ -2322,13 +2403,25 @@ const validateAndUpdateSponsoredFacilities = async (cachedResponse: any, q?: str
       const sponsoredCount = updatedData.filter((f: any) => f.isSponsored).length;
       const regularCount = updatedData.filter((f: any) => !f.isSponsored).length;
 
+      console.log(`📊 Final counts - Sponsored: ${sponsoredCount}, Regular: ${regularCount}`);
+      console.log(`📊 Total facilities on page 1: ${updatedData.length}`);
+      
+      // Debug: Log all facilities to verify
+      console.log('🔍 FINAL PAGE 1 FACILITIES:');
+      updatedData.forEach((facility: any, index: number) => {
+        const sponsoredStatus = facility.isSponsored ? '🏆 SPONSORED' : '📋 REGULAR';
+        console.log(`   ${index + 1}. ${facility.provider_name} - ${sponsoredStatus}`);
+      });
+
+      console.log('✅ Cache validation COMPLETED with updates');
+
       return {
         updated: true,
         data: {
           ...cachedResponse,
           data: updatedData,
+          total: cachedResponse.total, // Keep original total count
           sponsorshipInfo: {
-            ...cachedResponse.sponsorshipInfo,
             totalSponsored: sponsoredCount,
             sponsoredCount: sponsoredCount,
             regularCount: regularCount,
@@ -2340,13 +2433,20 @@ const validateAndUpdateSponsoredFacilities = async (cachedResponse: any, q?: str
                 priority: f.sponsoredData?.priority,
                 state: f.state,
                 city: f.city_town,
-                zip: f.zip_code
+                zip: f.zip_code,
+                sponsoredBy: f.sponsoredData?.sponsoredBy
               }))
+          },
+          searchInfo: {
+            ...cachedResponse.searchInfo,
+            sponsoredMatched: sponsoredCount,
+            totalSponsoredAvailable: currentActiveSponsored.length
           }
         }
       };
     }
 
+    console.log('✅ No changes needed to sponsored facilities');
     return { updated: false, data: cachedResponse };
   } catch (error) {
     console.error('❌ Error validating sponsored facilities:', error);
@@ -2354,11 +2454,125 @@ const validateAndUpdateSponsoredFacilities = async (cachedResponse: any, q?: str
   }
 };
 
-// Helper function to get matching sponsored facilities (reused from main logic)
+// Helper function to get matching sponsored facilities
 const getMatchingSponsoredFacilities = async (sponsoredFacilities: any[], q?: string, lat?: string, lng?: string) => {
-  // This would contain the same filtering logic as in the main function
-  // For brevity, I'm showing the structure - you would copy the filtering logic here
-  return sponsoredFacilities; // Simplified for example
+  const allowedStates = ["New York", "New Jersey", "Connecticut", "Pennsylvania"];
+  const allowedAbbr = ["NY", "NJ", "CT", "PA"];
+  const stateToAbbr: Record<string, string> = {
+    "New York": "NY",
+    "New Jersey": "NJ",
+    "Connecticut": "CT",
+    "Pennsylvania": "PA",
+  };
+  
+  const abbrToState: Record<string, string> = {
+    "NY": "New York",
+    "NJ": "New Jersey", 
+    "CT": "Connecticut",
+    "PA": "Pennsylvania"
+  };
+
+  let matchingSponsoredFacilities: any[] = [];
+
+  if (q) {
+    const cleanedQuery = q.replace(/_/g, " ").trim();
+    const { type, value } = normalizeQuery(cleanedQuery);
+
+    console.log(`🎯 Filtering new sponsored facilities for search: ${type} - "${value}"`);
+
+    matchingSponsoredFacilities = sponsoredFacilities.filter(sponsored => {
+      if (!sponsored.facility) {
+        return false;
+      }
+
+      const facility = sponsored.facility;
+      
+      if (type === "state") {
+        // Handle both full state names and abbreviations
+        const searchState = value.toLowerCase();
+        const facilityState = facility.state?.toLowerCase() || '';
+        
+        const matches = 
+          facilityState === searchState ||
+          facilityState === stateToAbbr[value]?.toLowerCase() ||
+          abbrToState[facility.state]?.toLowerCase() === searchState ||
+          facility.state?.toUpperCase() === value.toUpperCase();
+        
+        if (matches) {
+          console.log(`   ✅ NEW SPONSORED MATCH: ${facility.provider_name} in ${facility.state}`);
+        }
+        return matches;
+      } 
+      else if (type === "zip") {
+        const normalizedZip = value.padStart(5, "0");
+        const matches = facility.zip_code === normalizedZip;
+        if (matches) {
+          console.log(`   ✅ NEW SPONSORED MATCH: ${facility.provider_name} in ${facility.zip_code}`);
+        }
+        return matches;
+      }
+      else if (type === "city") {
+        const facilityCity = facility.city_town?.toLowerCase() || '';
+        const searchCity = value.toLowerCase();
+        const matches = facilityCity.includes(searchCity);
+        if (matches) {
+          console.log(`   ✅ NEW SPONSORED MATCH: ${facility.provider_name} in ${facility.city_town}`);
+        }
+        return matches;
+      }
+      else {
+        // General search - match name, city, or zip
+        const searchTerm = value.toLowerCase();
+        const facilityName = facility.provider_name?.toLowerCase() || '';
+        const facilityCity = facility.city_town?.toLowerCase() || '';
+        const facilityZip = facility.zip_code || '';
+        
+        const matches = 
+          facilityName.includes(searchTerm) ||
+          facilityCity.includes(searchTerm) || 
+          facilityZip.includes(searchTerm);
+        
+        if (matches) {
+          console.log(`   ✅ NEW SPONSORED MATCH: ${facility.provider_name}`);
+        }
+        return matches;
+      }
+    });
+  } 
+  else if (lat && lng) {
+    const latitude = parseFloat(lat!);
+    const longitude = parseFloat(lng!);
+    
+    console.log(`📍 Filtering new sponsored facilities by geo location: ${latitude}, ${longitude}`);
+    
+    matchingSponsoredFacilities = sponsoredFacilities.filter(sponsored => {
+      const facility = sponsored.facility;
+      if (!facility) return false;
+      
+      let facilityLat: number, facilityLng: number;
+      
+      if (facility.geoLocation?.coordinates) {
+        [facilityLng, facilityLat] = facility.geoLocation.coordinates;
+      } 
+      else if (facility.latitude && facility.longitude) {
+        facilityLat = facility.latitude;
+        facilityLng = facility.longitude;
+      } else {
+        return false;
+      }
+      
+      const distance = calculateDistance(latitude, longitude, facilityLat, facilityLng);
+      const isWithinRadius = distance <= 50;
+      
+      if (isWithinRadius) {
+        console.log(`   ✅ NEW SPONSORED GEO MATCH: ${facility.provider_name} within ${distance.toFixed(2)}km`);
+      }
+      return isWithinRadius;
+    });
+  }
+
+  console.log(`🎯 Found ${matchingSponsoredFacilities.length} new sponsored facilities matching search criteria`);
+  return matchingSponsoredFacilities;
 };
 
 // Helper function to calculate distance between coordinates
